@@ -1,0 +1,47 @@
+# === UniLinux Reparador - .gitignore ===
+
+# Logs generados por el script
+*.log
+/var/log/unilinux_*.log
+
+# Archivos temporales
+*.tmp
+*.bak
+*.swp
+*.swo
+*~
+\#*\#
+
+# Archivos de sistema
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Lockfiles y cooldown
+unilinux_reparador.lock
+unilinux_last_run
+
+# Archivos de disco/info temporales
+disco_info.txt
+
+# Editor configs
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# Caché de tests
+tests/__pycache__/
+tests/*.pyc
+.pytest_cache/
+
+# Música descargada (se genera al instalar)
+/music/*.wav
+/music/*.mp3
+/music/*.ogg
+
+# Build/empaquetado
+*.deb
+*.rpm
+*.tar.gz
+*.zip
