@@ -1,0 +1,139 @@
+#!/bin/bash
+# guardian-actualizar (Unilinux Guardian v4.19.1) — actualiza Guardian SOLO con un bundle FIRMADO.
+# Uso:  sudo guardian-actualizar BUNDLE.sh [--sin-instalar]
+#   Necesita BUNDLE.sh.sig al lado (ssh-keygen -Y sign, espacio de nombres "guardian-bundle").
+#   Pasos (para en el primer NO): copia el bundle a una carpeta privada -> verifica la firma con la
+#   llave pública FIJADA aquí abajo (nunca con una que traiga el bundle) -> extrae SIN ejecutar el
+#   bundle -> sumas del MANIFIESTO (y nada fuera de él) -> versión MÁS NUEVA que la instalada (nunca
+#   vuelve atrás) -> pruebas como usuario normal en otra copia -> instala con el instalador de la familia.
+#   --sin-instalar: hace todo salvo instalar (no necesita root si hay usuario para las pruebas).
+set -uo pipefail
+export LC_ALL=C
+PATH="$PATH:/usr/local/sbin:/usr/sbin:/sbin"
+
+readonly ESPACIO="guardian-bundle"
+readonly LLAVE_PUBLICA="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICUWE+EWoXv+6wc1RRC0cCFtmHCRFbzKmrPo7zQEhMpw"
+readonly INSTALADOS="/usr/lib/guardian/guardian /usr/local/sbin/guardian"
+
+TMP=""
+SI() { echo "SI $*"; }
+DATO() { echo "DATO $*"; }
+NO() { echo "NO $*"; echo "VEREDICTO ACTUALIZAR_NO"; [[ -n "$TMP" ]] && rm -rf "$TMP"; exit 1; }
+
+# 4.19.1: qué paquete trae $1 según el gestor (solo los nombres comprobados; si no, genérico)
+pista() {
+    local g=""
+    command -v xbps-install >/dev/null 2>&1 && g=xbps
+    command -v apk >/dev/null 2>&1 && g=apk
+    command -v apt-get >/dev/null 2>&1 && g=apt
+    case "$g:$1" in
+        xbps:xz) echo "xbps-install xz" ;;        xbps:ssh-keygen) echo "xbps-install openssh" ;;
+        apk:xz) echo "apk add xz" ;;              apk:ssh-keygen) echo "apk add openssh-keygen" ;;
+        apt:xz) echo "apt install xz-utils" ;;    apt:ssh-keygen) echo "apt install openssh-client" ;;
+        *) echo "instálalo con tu gestor de paquetes" ;;
+    esac
+}
+version_de() { sed -n 's/^readonly VERSION="\([0-9][0-9.]*\)"$/\1/p' "$1" 2>/dev/null | head -n 1; }
+mas_nueva() { [[ "$1" != "$2" ]] && [[ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -n 1)" == "$1" ]]; }
+
+main() {
+    local B="" SIN_INST=0 a S A U NV IV="" i f INST rc lst
+    for a in "$@"; do
+        case "$a" in
+            --sin-instalar) SIN_INST=1 ;;
+            -*) NO "opción desconocida: $a" ;;
+            *) [[ -z "$B" ]] || NO "solo un bundle"; B=$a ;;
+        esac
+    done
+    [[ -n "$B" ]] || NO "uso: guardian-actualizar BUNDLE.sh [--sin-instalar]"
+    (( SIN_INST == 1 )) || [[ $(id -u) -eq 0 ]] || NO "instalar necesita root (sudo)"
+    case "$LLAVE_PUBLICA" in ssh-ed25519\ *) ;; *) NO "esta copia no tiene llave pública fijada" ;; esac
+    for f in ssh-keygen base64 xz tar sha256sum sort mktemp timeout; do
+        command -v "$f" >/dev/null 2>&1 || NO "falta el programa $f ($(pista "$f"))"
+    done
+    S="$B.sig"
+    [[ -f "$B" && ! -L "$B" ]] || NO "no existe el bundle $B"
+    [[ -f "$S" && ! -L "$S" ]] || NO "falta la firma $S (sin firma no se instala)"
+
+    TMP=$(mktemp -d /tmp/guardian-actualizar.XXXXXX) || NO "mktemp"
+    chmod 700 "$TMP"
+    cp -- "$B" "$TMP/bundle.sh" && cp -- "$S" "$TMP/bundle.sig" || NO "no pude copiar bundle y firma"
+    A=$TMP/firmantes
+    printf 'guardian namespaces="%s" %s\n' "$ESPACIO" "$LLAVE_PUBLICA" >"$A"
+    if ! ssh-keygen -Y verify -f "$A" -I guardian -n "$ESPACIO" -s "$TMP/bundle.sig" \
+            <"$TMP/bundle.sh" >"$TMP/verif.txt" 2>&1; then
+        NO "FIRMA NO VÁLIDA: $(head -n 1 "$TMP/verif.txt")"
+    fi
+    grep -q '^Good "guardian-bundle" signature' "$TMP/verif.txt" || NO "ssh-keygen no dijo Good"
+    printf '%s\n' "$LLAVE_PUBLICA" >"$TMP/llave.pub"
+    SI "firma válida (llave fijada $(ssh-keygen -lf "$TMP/llave.pub" 2>/dev/null | awk 'NR==1{print $2}' | cut -c1-20)…)"
+
+    i=$(grep -a -n -m1 '^__CARGA__$' "$TMP/bundle.sh" | cut -d: -f1)
+    [[ -n "$i" ]] || NO "bundle sin carga"
+    mkdir "$TMP/arbol" || NO "mkdir"
+    tail -n +"$((i + 1))" "$TMP/bundle.sh" | base64 -d | xz -dc | tar -x -C "$TMP/arbol" --no-same-owner \
+        || NO "no se pudo extraer la carga"
+    ( cd "$TMP/arbol" && sha256sum -c --quiet MANIFIESTO.sha256 ) >/dev/null 2>&1 || NO "sumas del MANIFIESTO"
+    lst=$( cd "$TMP/arbol" && find . -type f ! -name MANIFIESTO.sha256 | sed 's|^\./||' | sort )
+    [[ "$lst" == "$(sed 's/^[0-9a-f]*  //' "$TMP/arbol/MANIFIESTO.sha256" | sort)" ]] \
+        || NO "hay archivos fuera del MANIFIESTO"
+    [[ -z "$( cd "$TMP/arbol" && find . ! -type f ! -type d )" ]] || NO "la carga trae enlaces o especiales"
+    chmod 755 "$TMP"/arbol/bin/*
+    SI "extraído sin ejecutar el bundle; sumas bien"
+
+    NV=$(version_de "$TMP/arbol/bin/guardian")
+    [[ -n "$NV" ]] || NO "no leo la versión del bundle"
+    sed -n 2p "$TMP/bundle.sh" | grep -qF "Guardian v$NV " || NO "cabecera del bundle ≠ versión $NV"
+    for f in $INSTALADOS; do [[ -f "$f" ]] && { IV=$(version_de "$f"); [[ -n "$IV" ]] && break; }; done
+    if [[ -n "$IV" ]]; then
+        mas_nueva "$NV" "$IV" || NO "versión $NV no es más nueva que la instalada $IV (no vuelvo atrás)"
+        SI "versión $NV > instalada $IV"
+    else
+        DATO "no hay Guardian instalado; versión $NV"
+    fi
+
+    U=${SUDO_USER:-}
+    [[ $(id -u) -ne 0 ]] && U=$(id -un)
+    [[ -n "$U" && "$U" != root ]] || U=nobody
+    id "$U" >/dev/null 2>&1 || NO "no existe el usuario $U para las pruebas"
+    mkdir "$TMP/p" "$TMP/p/home" && cp -r "$TMP/arbol" "$TMP/p/G" || NO "copia de pruebas"
+    if [[ $(id -u) -eq 0 ]]; then chmod 711 "$TMP"; chown -R "$U" "$TMP/p" || NO "chown pruebas"; fi
+    rc=0
+    for f in "$TMP"/p/G/tests/*.sh; do
+        f=${f##*/}
+        if [[ $f == test-nonext.sh ]] && ! command -v dash >/dev/null 2>&1; then DATO "sin dash: omito $f"; continue; fi
+        if [[ $(id -u) -eq 0 ]]; then
+            ( cd "$TMP/p/G" && timeout 1200 runuser -u "$U" -- env HOME="$TMP/p/home" PATH="$PATH" bash "tests/$f" </dev/null ) \
+                >"$TMP/p/$f.log" 2>&1
+        else
+            ( cd "$TMP/p/G" && HOME="$TMP/p/home" timeout 1200 bash "tests/$f" </dev/null ) >"$TMP/p/$f.log" 2>&1
+        fi
+        (( $? == 0 )) || { rc=1; echo "NO prueba $f: $(tail -n 2 "$TMP/p/$f.log" | tr '\n' ' ' | cut -c1-80)"; }
+    done
+    (( rc == 0 )) || NO "fallaron pruebas; no instalo"
+    ( cd "$TMP/arbol" && sha256sum -c --quiet MANIFIESTO.sha256 ) >/dev/null 2>&1 || NO "el árbol cambió tras las pruebas"
+    SI "pruebas bien (usuario $U)"
+
+    if (( SIN_INST == 1 )); then
+        rm -rf "$TMP"; echo "VEREDICTO ACTUALIZAR_VERIFICADO_OK (no instalé: --sin-instalar)"; return 0
+    fi
+    if [[ -e /etc/NIXOS ]]; then
+        NO "NixOS: copia el árbol a /etc/nixos/guardian y nixos-rebuild boot (no lo hago aquí)"
+    elif [[ -d /etc/minios ]] || [[ -d /minios ]]; then
+        NO "MiniOS: se instala con instalar-en-disco desde otro sistema"
+    elif command -v apk >/dev/null 2>&1; then INST=instalar-mkinitfs
+    elif [[ ! -d /run/systemd/system ]] && { command -v xbps-install || command -v emerge; } >/dev/null 2>&1; then
+        INST=instalar-dracut-sinsd
+    else INST=install-guardian; fi
+    DATO "instalador: $INST"
+    bash "$TMP/arbol/bin/$INST" </dev/null >"$TMP/instalar.log" 2>&1
+    rc=$?
+    mkdir -p /var/log/guardian && cp "$TMP/instalar.log" "/var/log/guardian/actualizar-$NV.log" 2>/dev/null
+    (( rc == 0 )) || NO "el instalador terminó con rc=$rc (registro /var/log/guardian/actualizar-$NV.log)"
+    IV=$(version_de /usr/lib/guardian/guardian)
+    [[ "$IV" == "$NV" ]] || NO "tras instalar, la versión es '$IV' y no $NV"
+    SI "instalada $NV (registro /var/log/guardian/actualizar-$NV.log)"
+    rm -rf "$TMP"
+    echo "VEREDICTO ACTUALIZAR_OK"
+}
+main "$@"

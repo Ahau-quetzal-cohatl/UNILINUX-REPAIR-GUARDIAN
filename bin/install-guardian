@@ -1,0 +1,474 @@
+#!/bin/bash
+# Instalador Unilinux Guardian v4.19.1 (Ahau Quetzalcóatl y Claude) — COPIAS root:root (nunca symlinks a /home)
+# Initramfs: Debian/Ubuntu (initramfs-tools) y Arch (mkinitcpio, variantes systemd y busybox).
+set -euo pipefail
+SRC="$(cd "$(dirname "$0")" && pwd)"
+
+# ── Arch: archivos del gancho mkinitcpio ($1 = prefijo; vacío = sistema real) ──
+ARCH_FILES=(/etc/initcpio/hooks/guardian /etc/initcpio/install/guardian
+            /usr/lib/guardian/guardian-early-initrd.service /etc/mkinitcpio.conf.d/guardian.conf)
+escribir_archivos_arch() {
+    local D="$1"
+    mkdir -p "$D/etc/initcpio/hooks" "$D/etc/initcpio/install" "$D/usr/local/share/guardian" "$D/usr/lib/guardian" "$D/etc/mkinitcpio.conf.d"
+    cat > "$D/etc/initcpio/hooks/guardian" << 'ARCHRUN'
+#!/usr/bin/ash
+# Guardian — gancho de EJECUCIÓN para mkinitcpio (initramfs busybox, sin el gancho "systemd").
+# Corre antes de que init monte la raíz (y antes de su fsck). Nunca bloquea el arranque.
+run_hook() {
+    [ -x /usr/bin/guardian-early ] || return 0
+    # init ya dejó "$root" (de la línea del kernel). Espera hasta 10 s a que el disco aparezca.
+    _g_spec="${root:-}"
+    case "$_g_spec" in
+        UUID=*)      _g_dev="/dev/disk/by-uuid/${_g_spec#UUID=}" ;;
+        LABEL=*)     _g_dev="/dev/disk/by-label/${_g_spec#LABEL=}" ;;
+        PARTUUID=*)  _g_dev="/dev/disk/by-partuuid/${_g_spec#PARTUUID=}" ;;
+        PARTLABEL=*) _g_dev="/dev/disk/by-partlabel/${_g_spec#PARTLABEL=}" ;;
+        /*)          _g_dev="$_g_spec" ;;
+        *)           _g_dev="" ;;
+    esac
+    _g_n=0
+    while [ -n "$_g_dev" ] && [ ! -e "$_g_dev" ] && [ "$_g_n" -lt 10 ]; do
+        sleep 1; _g_n=$((_g_n + 1))
+    done
+    /usr/bin/guardian-early || :
+    return 0
+}
+ARCHRUN
+    cat > "$D/etc/initcpio/install/guardian" << 'ARCHBUILD'
+#!/bin/bash
+# Guardian — gancho de CONSTRUCCIÓN para mkinitcpio. Sirve para las dos variantes:
+#   busybox (HOOKS con "udev")  → usa /etc/initcpio/hooks/guardian (run_hook)
+#   systemd (HOOKS con "systemd", la predeterminada de Arch) → usa guardian-early.service
+# Colocar "guardian" en HOOKS después de "block" y "filesystems" (y de "resume" si existe), antes de "fsck".
+# (Lo hace solo /etc/mkinitcpio.conf.d/guardian.conf.)
+build() {
+    local t p
+    add_file "$(if [[ -x /usr/lib/guardian/guardian-early ]]; then echo /usr/lib/guardian/guardian-early; else echo /usr/local/sbin/guardian-early; fi)" /usr/bin/guardian-early 755
+    # Shell: con busybox ya existe /usr/bin/sh; en un initramfs systemd sin "base" puede no existir
+    if [[ ! -e "$BUILDROOT/usr/bin/sh" && ! -L "$BUILDROOT/usr/bin/sh" ]]; then
+        add_binary bash
+        add_symlink /usr/bin/sh bash
+    fi
+    for t in btrfs btrfs-image xfs_repair xfs_db; do
+        if p=$(type -P "$t"); then add_binary "$p" "/usr/bin/$t"; fi
+    done
+    for t in e2fsck blkid e2image; do
+        if p=$(type -P "$t"); then add_binary "$p" "/usr/bin/$t"
+        else warning "guardian: falta %s (la fase early se omitirá o quedará sin metadatos)" "$t"; fi
+    done
+    # Comandos básicos: solo si la imagen aún no los trae (no tapar los de busybox).
+    # "date" (v4.12): para que los respaldos lleven fecha en el nombre.
+    for t in cat mkdir rmdir readlink mount umount sleep sync date; do
+        [[ -e "$BUILDROOT/usr/bin/$t" || -L "$BUILDROOT/usr/bin/$t" ]] || add_binary "$t"
+    done
+    # df real con otro nombre (no tapa el de busybox)
+    p=$(type -P df) && add_binary "$p" /usr/bin/guardian-df
+    for t in ext4 vfat 'btrfs?' 'xfs?' 'nls_cp437?' 'nls_iso8859_1?' 'nls_ascii?' 'nls_utf8?'; do add_module "$t"; done
+    [[ -f /etc/guardian/early.conf ]] && add_file /etc/guardian/early.conf /etc/guardian-early.conf 644
+    add_runscript
+    # Variante systemd: los run_hook NO se ejecutan; hace falta una unidad
+    if [[ -e "$BUILDROOT/usr/lib/systemd/systemd" ]]; then
+        add_file /usr/lib/guardian/guardian-early-initrd.service \
+                 /usr/lib/systemd/system/guardian-early.service 644
+        add_symlink /usr/lib/systemd/system/initrd-root-fs.target.wants/guardian-early.service \
+                    ../guardian-early.service
+    fi
+}
+help() {
+    cat <<HELPEOF
+Guardian: revisa y repara la raíz ext2/3/4 (e2fsck) ANTES de montarla y deja el
+resultado en /run/guardian/early_status. Configuración: /etc/guardian/early.conf
+(tras editarla: mkinitcpio -P). Saltar una vez: guardian.skip en la línea del kernel.
+HELPEOF
+}
+ARCHBUILD
+    cat > "$D/usr/lib/guardian/guardian-early-initrd.service" << 'ARCHUNIT'
+[Unit]
+Description=Guardian early: revisa la raiz antes de montarla
+DefaultDependencies=no
+ConditionPathExists=/etc/initrd-release
+After=initrd-root-device.target systemd-hibernate-resume.service
+Before=systemd-fsck-root.service sysroot.mount initrd-root-fs.target shutdown.target
+Conflicts=shutdown.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/guardian-early
+StandardOutput=journal+console
+StandardError=journal+console
+TimeoutStartSec=0
+ARCHUNIT
+    cat > "$D/etc/mkinitcpio.conf.d/guardian.conf" << 'ARCHDROPIN'
+# Guardian: añade el gancho "guardian" a HOOKS justo antes de "fsck" (o al final si no hay "fsck"),
+# sin editar /etc/mkinitcpio.conf. Si "guardian" ya está en HOOKS no cambia nada.
+# Quitar Guardian del initramfs: borrar este archivo y ejecutar  mkinitcpio -P
+if [[ " ${HOOKS[*]} " != *" guardian "* ]]; then
+    _g_new=(); _g_put=0
+    for _g_h in "${HOOKS[@]}"; do
+        if [[ "$_g_h" == fsck && "$_g_put" == 0 ]]; then _g_new+=(guardian); _g_put=1; fi
+        _g_new+=("$_g_h")
+    done
+    [[ "$_g_put" == 1 ]] || _g_new+=(guardian)
+    HOOKS=("${_g_new[@]}")
+    unset _g_new _g_put _g_h
+fi
+ARCHDROPIN
+    chmod 644 "$D/etc/initcpio/hooks/guardian" "$D/etc/initcpio/install/guardian" \
+              "$D/usr/lib/guardian/guardian-early-initrd.service" "$D/etc/mkinitcpio.conf.d/guardian.conf"
+}
+# HOOKS que mkinitcpio usará de verdad (mkinitcpio.conf + conf.d/*.conf, en ese orden). $1 = prefijo.
+hooks_efectivos() {
+    bash -c 'HOOKS=(); . "$1/etc/mkinitcpio.conf" 2>/dev/null
+             for f in "$1"/etc/mkinitcpio.conf.d/*.conf; do [[ -f "$f" ]] && . "$f" 2>/dev/null; done
+             echo "${HOOKS[*]}"' _ "$1" 2>/dev/null || true
+}
+# Imágenes initramfs que generan los presets de mkinitcpio
+imagenes_arch() {
+    local p
+    for p in /etc/mkinitcpio.d/*.preset; do
+        [[ -f "$p" ]] || continue
+        ( set +u; PRESETS=(); . "$p" 2>/dev/null
+          for s in "${PRESETS[@]}"; do v="${s}_image"; [[ -n "${!v}" ]] && echo "${!v}"; done )
+    done | sort -u
+}
+# Solo para las pruebas (sin root): escribe los archivos de Arch en un directorio y termina.
+if [[ -n "${GUARDIAN_EMIT_ARCH:-}" ]]; then
+    escribir_archivos_arch "$GUARDIAN_EMIT_ARCH"
+    [[ "${GUARDIAN_EMIT_HOOKS:-0}" == 1 ]] && hooks_efectivos "$GUARDIAN_EMIT_ARCH"
+    exit 0
+fi
+
+[[ $(id -u) -eq 0 ]] || { echo "Usa: sudo bash $0"; exit 1; }
+for f in guardian guardian-early; do
+    [[ -f "$SRC/$f" ]] || { echo "Falta $SRC/$f"; exit 1; }
+done
+
+KVER="${GUARDIAN_KVER:-$(uname -r)}"
+IN_CHROOT="${GUARDIAN_CHROOT:-0}"
+REGEN="sudo update-initramfs -u"
+if [[ ! -d /etc/initramfs-tools && -f /etc/mkinitcpio.conf ]]; then REGEN="sudo mkinitcpio -P"; fi
+echo "→ Instalando Unilinux Guardian v4.19.1... (kernel objetivo: $KVER)"
+
+# Limpiar versiones anteriores
+for u in unilinux-reparador guardian-reparador guardian-late; do
+    systemctl disable --now "$u.service" 2>/dev/null || true
+    rm -f "/etc/systemd/system/$u.service"
+done
+rm -f /etc/initramfs-tools/hooks/{unilinux,guardian}
+rm -f /etc/initramfs-tools/scripts/local-premount/{unilinux,guardian}
+rm -f /usr/local/sbin/unilinux
+
+mkdir -p /usr/local/sbin
+# Binarios: copia real, root:root 755
+install -o root -g root -m 755 "$SRC/guardian-early" /usr/local/sbin/guardian-early
+# 4.18.5: copia en /usr/lib/guardian, que va con la raiz (la de sbin de arriba
+# queda tapada si su /usr/.../local es otro subvolumen o particion)
+install -d -m 0755 -o root -g root /usr/lib/guardian
+install -o root -g root -m 755 "$SRC/guardian-early" /usr/lib/guardian/guardian-early
+install -o root -g root -m 755 "$SRC/guardian"       /usr/lib/guardian/guardian
+install -o root -g root -m 755 "$SRC/guardian"       /usr/local/sbin/guardian
+echo "  ✔ /usr/local/sbin y /usr/lib/guardian: {guardian,guardian-early} (root:root 755)"
+# 4.19.0: actualizador que solo acepta bundles firmados (llave pública fijada dentro)
+if [[ -f "$SRC/guardian-actualizar" ]]; then
+    install -o root -g root -m 755 "$SRC/guardian-actualizar" /usr/lib/guardian/guardian-actualizar
+    install -o root -g root -m 755 "$SRC/guardian-actualizar" /usr/local/sbin/guardian-actualizar
+    echo "  ✔ guardian-actualizar (solo bundles firmados)"
+fi
+
+# Directorios de root
+install -d -m 0750 -o root -g root /var/lib/guardian /var/log/guardian
+install -d -m 0755 -o root -g root /etc/guardian /usr/local/share/guardian
+
+# Música (opcional) copiada a ubicación de root
+MUSIC="$SRC/../music/tema_guardian.ogg"
+if [[ -f "$MUSIC" ]]; then
+    install -o root -g root -m 644 "$MUSIC" /usr/local/share/guardian/tema_guardian.ogg
+    echo "  ✔ música copiada a /usr/local/share/guardian"
+fi
+
+# Configuración de early (no se sobrescribe si ya existe)
+if [[ ! -f /etc/guardian/early.conf ]]; then
+    cat > /etc/guardian/early.conf << 'CONF'
+# Guardian early (initramfs). Se copia al initramfs al regenerarlo.
+# ON_FAIL = qué hacer si la raíz tiene un daño que e2fsck -p no puede reparar:
+#   nada               → no tocar nada (el sistema puede detener el arranque pidiendo fsck manual)
+#   solo_con_respaldo  → reparar a la fuerza (-y) SOLO si se logró el respaldo antes
+#   respaldo_y_forzar  → respaldo si hay espacio; si no hay, reparar a la fuerza igualmente
+#   forzar             → reparar a la fuerza sin respaldo
+# El respaldo es un archivo de deshacer de e2fsck (e2undo) en otra partición con espacio libre.
+# BACKUP_MIN_MB = espacio libre mínimo (MB) que debe tener esa partición.
+# BACKUP_EXCLUDE = (opcional) UUIDs separados por espacio de particiones que NUNCA se usan para el respaldo.
+# META_MIN_MB   = espacio libre mínimo (MB) para guardar además una imagen de METADATOS (e2image -r) del disco antes de repararlo.
+# BACKUP_UUID   = (opcional) UUID de la ÚNICA partición donde guardar el respaldo; vacío = la primera con espacio.
+# IMPORTANTE: tras editar este archivo regenera el initramfs:
+#   Debian/Ubuntu: sudo update-initramfs -u        Arch: sudo mkinitcpio -P
+ON_FAIL=respaldo_y_forzar
+BACKUP_MIN_MB=512
+META_MIN_MB=2048
+BACKUP_UUID=
+CONF
+    chmod 644 /etc/guardian/early.conf
+elif ! grep -q '^ON_FAIL=' /etc/guardian/early.conf; then
+    # Actualización de una instalación anterior: añade la política nueva sin tocar lo demás
+    {
+        echo ""
+        echo "# Añadido por Guardian v4.10: qué hacer si la raíz tiene un daño que e2fsck -p no puede reparar."
+        echo "#   nada | solo_con_respaldo | respaldo_y_forzar | forzar   (BACKUP_UUID vacío = primera partición con espacio)"
+        echo "ON_FAIL=respaldo_y_forzar"
+        echo "BACKUP_MIN_MB=512"
+        echo "BACKUP_UUID="
+    } >> /etc/guardian/early.conf
+    echo "  ✔ early.conf actualizado: ON_FAIL=respaldo_y_forzar (política nueva)"
+fi
+
+# Servicio de fase tardía
+cat > /etc/systemd/system/guardian-late.service << 'SERVICE'
+[Unit]
+Description=Guardian UniLinux Repair v4.19.1 (fase tardía)
+After=local-fs.target sound.target
+ConditionPathExists=!/run/guardian.skip
+
+[Service]
+Type=oneshot
+ExecStart=/usr/lib/guardian/guardian --no-music --no-packages
+# 3 = "sin errores pero con avisos de hardware": no es un fallo del servicio
+SuccessExitStatus=3
+Nice=10
+TimeoutStartSec=300
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+SERVICE
+chmod 644 /etc/systemd/system/guardian-late.service
+[[ "$IN_CHROOT" == "1" ]] || [[ ! -d /run/systemd/system ]] || systemctl daemon-reload || true   # (4.18.5) sin systemd (sysvinit) no aborta
+if ! systemctl enable guardian-late.service 2>/dev/null; then
+    mkdir -p /etc/systemd/system/multi-user.target.wants
+    ln -sf /etc/systemd/system/guardian-late.service /etc/systemd/system/multi-user.target.wants/guardian-late.service
+fi
+[[ -L /etc/systemd/system/multi-user.target.wants/guardian-late.service ]] || { echo "✖ El servicio no quedó habilitado"; exit 1; }
+echo "  ✔ guardian-late.service (After=local-fs.target, WantedBy=multi-user.target)"
+
+# >>> sysvinit (4.18.5): MX Linux (init-diversity), Devuan, antiX... = initramfs-tools con sysvinit como PID 1.
+# Con systemd manda guardian-late.service (systemd ignora un init.d con el nombre de una unidad nativa).
+sysv_hay() { [[ -d "$1/etc/init.d" ]] && { [[ -x "$1/usr/lib/sysvinit/init" ]] || [[ -x "$1/lib/sysvinit/init" ]]; }; }
+sysv_script() { cat << 'SYSV'
+#!/bin/sh
+### BEGIN INIT INFO
+# Provides:          guardian-late
+# Required-Start:    $local_fs $remote_fs
+# Required-Stop:
+# Default-Start:     2 3 4 5
+# Default-Stop:
+# Short-Description: Guardian: revision tras arrancar (fase tardia)
+### END INIT INFO
+# Guardian v4.19.1 (install-guardian): fase tardía con sysvinit. Una vez por arranque y en segundo plano
+# (no retrasa el arranque); nunca hace fallar nada. Con systemd no corre: manda guardian-late.service.
+G=${GUARDIAN_BIN:-/usr/lib/guardian/guardian}
+RUN=${GUARDIAN_RUN:-/run}
+LOG=${GUARDIAN_LATE_LOG:-/var/log/guardian-late.log}
+case "$1" in
+    start)
+        [ -d "$RUN/systemd/system" ] && exit 0
+        [ -e "$RUN/guardian-late.hecho" ] && exit 0
+        : > "$RUN/guardian-late.hecho" 2>/dev/null
+        if [ -e "$RUN/guardian.skip" ]; then echo "guardian.skip: no corro" > "$LOG"; exit 0; fi
+        ( timeout 300 nice -n 10 "$G" --no-music --no-packages > "$LOG" 2>&1; echo "rc=$?" >> "$LOG" ) </dev/null >/dev/null 2>&1 &
+        exit 0 ;;
+    stop|restart|force-reload|status) exit 0 ;;
+    *) echo "Uso: $0 {start|stop}" >&2; exit 3 ;;
+esac
+SYSV
+}
+# $1 = raíz ("" = este sistema). Instala /etc/init.d/guardian-late y lo enlaza en los niveles 2-5.
+sysv_tardia() {
+    local R="$1" n
+    sysv_hay "$R" || return 0
+    sysv_script > "$R/etc/init.d/guardian-late" && chmod 755 "$R/etc/init.d/guardian-late" || return 1
+    if [[ -z "$R" ]] && command -v update-rc.d >/dev/null 2>&1; then
+        update-rc.d guardian-late defaults >/dev/null 2>&1 || true
+    fi
+    ls "$R"/etc/rc2.d/S*guardian-late >/dev/null 2>&1 || for n in 2 3 4 5; do
+        [[ -d "$R/etc/rc$n.d" ]] && ln -sfn ../init.d/guardian-late "$R/etc/rc$n.d/S99guardian-late"; done
+    ls "$R"/etc/rc2.d/S*guardian-late >/dev/null 2>&1 || return 1
+    echo "  ✔ fase tardía también para sysvinit: /etc/init.d/guardian-late (niveles 2-5)"
+}
+# <<< sysvinit
+sysv_tardia "" || { echo "✖ La fase tardía para sysvinit no quedó instalada"; exit 1; }
+
+# (4.17.0) La rama dracut va DESPUÉS de la fase tardía: Fedora/openSUSE reciben las dos fases.
+# ── dracut (Fedora, openSUSE...): la fase early la instala instalar-dracut ──
+if [[ ! -d /etc/initramfs-tools ]] \
+   && ! { [[ -f /etc/mkinitcpio.conf ]] && command -v mkinitcpio >/dev/null 2>&1; } \
+   && command -v dracut >/dev/null 2>&1; then
+    if [[ "${GUARDIAN_SOLO_TARDIA:-0}" == 1 ]]; then   # (4.17.1) la early la pone instalar-en-disco
+        echo "  ✔ Fase tardía (guardian-late) instalada; la fase early la pone instalar-dracut desde fuera."
+        exit 0
+    fi
+    [[ -f "$SRC/instalar-dracut" ]] || { echo "Falta $SRC/instalar-dracut"; exit 1; }
+    echo "→ Este sistema usa dracut: la fase early se instala con instalar-dracut."
+    echo "  ✔ La fase tardía (guardian-late) ya quedó instalada; ahora la fase early."
+    DR_ARGS=(--early "$SRC/guardian-early")
+    if [[ -n "${GUARDIAN_KVER:-}" ]]; then DR_ARGS+=(--kernel "$GUARDIAN_KVER"); fi
+    exec bash "$SRC/instalar-dracut" "${DR_ARGS[@]}"
+fi
+
+# Initramfs: solo guardian-early
+if [[ -d /etc/initramfs-tools ]]; then
+    mkdir -p /etc/initramfs-tools/hooks /etc/initramfs-tools/scripts/local-premount
+    cat > /etc/initramfs-tools/hooks/guardian << 'HOOK'
+#!/bin/sh
+PREREQ=""
+prereqs() { echo "$PREREQ"; }
+case $1 in prereqs) prereqs; exit 0;; esac
+. /usr/share/initramfs-tools/hook-functions
+PATH=/sbin:/usr/sbin:/bin:/usr/bin
+if [ -x /usr/lib/guardian/guardian-early ]; then copy_exec /usr/lib/guardian/guardian-early /sbin/guardian-early; else copy_exec /usr/local/sbin/guardian-early /sbin/guardian-early; fi
+for t in btrfs btrfs-image xfs_repair xfs_db; do
+    p=$(command -v "$t") && copy_exec "$p" /sbin
+done
+for t in e2fsck blkid e2image; do
+    p=$(command -v "$t") || { echo "guardian: falta $t" >&2; continue; }
+    copy_exec "$p" /sbin
+done
+# df real, con otro nombre para no tapar el busybox del initramfs
+dfp=$(command -v df) && copy_exec "$dfp" /usr/bin/guardian-df
+manual_add_modules vfat fat nls_ascii nls_cp437 nls_iso8859_1 2>/dev/null || true
+mkdir -p "$DESTDIR/etc"
+[ -f /etc/guardian/early.conf ] && cp /etc/guardian/early.conf "$DESTDIR/etc/guardian-early.conf"
+exit 0
+HOOK
+    chmod 755 /etc/initramfs-tools/hooks/guardian
+
+    # PREREQ="resume": debe correr DESPUÉS de resume, para no tocar un FS hibernado
+    cat > /etc/initramfs-tools/scripts/local-premount/guardian << 'SCRIPT'
+#!/bin/sh
+PREREQ="resume"
+prereqs() { echo "$PREREQ"; }
+case $1 in prereqs) prereqs; exit 0;; esac
+[ -x /sbin/guardian-early ] && /sbin/guardian-early
+exit 0
+SCRIPT
+    chmod 755 /etc/initramfs-tools/scripts/local-premount/guardian
+
+    update-initramfs -u -k "$KVER"
+    echo "  ✔ initramfs regenerado"
+
+    # ── Verificación del initramfs resultante ──
+    img="/boot/initrd.img-$KVER"
+    if [[ -r "$img" ]] && command -v lsinitramfs &>/dev/null; then
+        list=$(lsinitramfs "$img" 2>/dev/null || true)
+        for pat in 'bin/guardian-early' 'bin/e2fsck' 'bin/blkid' 'bin/e2image' 'bin/guardian-df' 'local-premount/guardian'; do
+            if grep -q "$pat" <<<"$list"; then echo "  ✔ initramfs contiene $pat"
+            else echo "  ⚠ initramfs NO contiene $pat (early se omitirá)"; fi
+        done
+        if command -v unmkinitramfs &>/dev/null; then
+            tmp=$(mktemp -d)
+            unmkinitramfs "$img" "$tmp" 2>/dev/null || true
+            order=$(find "$tmp" -path '*local-premount/ORDER' 2>/dev/null | head -n1 || true)
+            if [[ -n "$order" ]]; then
+                rl=$(grep -n 'local-premount/resume' "$order" | head -n1 | cut -d: -f1 || true)
+                gl=$(grep -n 'local-premount/guardian' "$order" | head -n1 | cut -d: -f1 || true)
+                if [[ -n "$rl" && -n "$gl" ]]; then
+                    if (( rl < gl )); then echo "  ✔ orden correcto: resume (línea $rl) antes que guardian (línea $gl)"
+                    else echo "  ⚠ ORDEN INCORRECTO: guardian corre antes que resume. NO uses en equipos que hibernan."; fi
+                else
+                    echo "  ℹ No hay script 'resume' en el ORDER (probablemente sin hibernación): guardian línea ${gl:-?}"
+                fi
+            fi
+            rm -rf "$tmp"
+        fi
+    fi
+elif [[ -f /etc/mkinitcpio.conf ]] && command -v mkinitcpio &>/dev/null; then
+    # ── Arch Linux (mkinitcpio) ──
+    echo "→ Initramfs de Arch (mkinitcpio) detectado"
+    mapfile -t IMGS < <(imagenes_arch)
+    falta=""
+    for t in e2fsck blkid lsinitcpio; do command -v "$t" &>/dev/null || falta="$falta $t"; done
+    if (( ${#IMGS[@]} == 0 )); then
+        echo "  ⚠ Los presets de mkinitcpio no generan imágenes initramfs clásicas (¿UKI?): todavía NO soportado."
+        echo "    Queda instalada SOLO la fase tardía; el initramfs no se tocó."
+    elif [[ -n "$falta" ]]; then
+        echo "  ⚠ Faltan programas:$falta → queda instalada SOLO la fase tardía; el initramfs no se tocó."
+    else
+        mkdir -p /var/backups/guardian-initrd
+        BKD=$(mktemp -d "/var/backups/guardian-initrd/arch-$(date +%Y%m%d_%H%M%S).XXXXXX")   # único: nunca mezcla dos respaldos
+        mkdir -p "$BKD/prev"
+        for f in "${IMGS[@]}"; do
+            [[ -f "$f" ]] || continue
+            cp -a "$f" "$BKD/${f##*/}" || { echo "✖ No se pudo respaldar $f (no se tocó el initramfs)"; exit 1; }
+        done
+        for f in "${ARCH_FILES[@]}"; do [[ -f "$f" ]] && cp -a "$f" "$BKD/prev/${f//\//_}"; done
+        echo "  ✔ respaldo de las imágenes actuales: $BKD"
+        arch_restaurar() {
+            local f
+            echo "⚠ Restaurando las imágenes initramfs y los archivos del gancho anteriores..."
+            for f in "${ARCH_FILES[@]}"; do
+                if [[ -f "$BKD/prev/${f//\//_}" ]]; then cp -a "$BKD/prev/${f//\//_}" "$f"; else rm -f "$f"; fi
+            done
+            for f in "${IMGS[@]}"; do
+                [[ -f "$BKD/${f##*/}" ]] || continue
+                if cp -a "$BKD/${f##*/}" "$f"; then echo "  ✔ restaurada $f"
+                else echo "  ✖ NO se pudo restaurar $f; copia a mano: $BKD/${f##*/} → $f"; fi
+            done
+        }
+        escribir_archivos_arch ""
+        HK=" $(hooks_efectivos "") "
+        echo "  ℹ HOOKS efectivos:$HK"
+        if [[ "$HK" != *" guardian "* ]]; then
+            echo "✖ 'guardian' no quedó en HOOKS"; arch_restaurar; exit 1
+        fi
+        if [[ "$HK" == *" systemd "* ]]; then
+            VAR=systemd
+            echo "  ℹ variante systemd: guardian-early.service (After=systemd-hibernate-resume.service)"
+        else
+            VAR=busybox
+            if [[ "$HK" == *" resume "* && "${HK%%guardian *}" != *" resume "* ]]; then
+                echo "  ⚠ ORDEN INCORRECTO: 'guardian' está antes que 'resume' en HOOKS. NO uses en equipos que hibernan."
+            fi
+        fi
+        if ! mkinitcpio -P; then
+            echo "✖ mkinitcpio -P terminó con error"; arch_restaurar; exit 1
+        fi
+        echo "  ✔ initramfs regenerado (mkinitcpio -P, variante $VAR)"
+        # ── Verificación de cada imagen ──
+        if [[ "$VAR" == systemd ]]; then
+            ESENCIAL=('usr/bin/guardian-early' 'usr/bin/e2fsck' 'usr/bin/blkid' 'usr/lib/systemd/system/guardian-early.service' 'initrd-root-fs.target.wants/guardian-early.service')
+        else
+            ESENCIAL=('usr/bin/guardian-early' 'usr/bin/e2fsck' 'usr/bin/blkid' 'hooks/guardian')
+        fi
+        malo=0
+        for f in "${IMGS[@]}"; do
+            [[ -f "$f" ]] || { echo "  ⚠ no existe $f"; continue; }
+            sz=$(stat -c %s "$f" 2>/dev/null || echo 0)
+            list=$(lsinitcpio "$f" 2>/dev/null || true)
+            if (( sz < 1000000 )) || [[ -z "$list" ]]; then echo "  ✖ $f no se puede leer o es demasiado pequeña ($sz bytes)"; malo=1; continue; fi
+            for pat in "${ESENCIAL[@]}"; do
+                if grep -qE "(^|/)${pat}\$" <<<"$list"; then echo "  ✔ ${f##*/} contiene $pat"
+                else echo "  ✖ ${f##*/} NO contiene $pat"; malo=1; fi
+            done
+            for pat in 'usr/bin/e2image' 'usr/bin/guardian-df' 'usr/bin/date' 'etc/guardian-early.conf'; do
+                if grep -qE "(^|/)${pat}\$" <<<"$list"; then echo "  ✔ ${f##*/} contiene $pat"
+                else echo "  ⚠ ${f##*/} NO contiene $pat (funciona, pero con menos respaldo o sin fecha)"; fi
+            done
+        done
+        if (( malo )); then
+            echo "✖ Alguna imagen quedó sin piezas esenciales"; arch_restaurar; exit 1
+        fi
+    fi
+else
+    echo "  ⚠ No se reconoce el initramfs de este sistema (ni initramfs-tools ni mkinitcpio):"
+    echo "    queda instalada SOLO la fase tardía; la raíz no se revisa antes de montarla."
+fi
+
+echo ""
+echo "✅ Unilinux Guardian v4.19.1 instalado"
+echo "   Prueba:   sudo guardian --dry-run   |   sudo guardian --safe"
+echo "   Saltar:   touch /run/guardian.skip (late)  |  guardian.skip en la línea de kernel (early)"
+echo "   Logs:     /var/log/guardian   Estado: /var/lib/guardian   Early: /run/guardian/early.log"
+echo "   Tras reiniciar: journalctl -u guardian-late (sysvinit: cat /var/log/guardian-late.log) ; cat /run/guardian/early_status"
+echo "   Si cambias /etc/guardian/early.conf: $REGEN"
+echo "   Reparar paquetes (no corre en el arranque): sudo guardian"
+echo "   Si cambias los scripts en $SRC, vuelve a ejecutar este instalador como root."

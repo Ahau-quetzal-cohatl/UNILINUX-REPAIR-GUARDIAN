@@ -1,0 +1,351 @@
+#!/bin/bash
+# instalar-dracut-sinsd v1.0 (Guardian 4.18.1) — Guardian early en un initramfs de dracut SIN systemd
+# (Void con runit; Gentoo u otros con OpenRC). instalar-dracut se niega con estos («no es de systemd»).
+# Módulo dracut «guardian-sinsd» (70guardian-sinsd): el init de dracut (99base) lee con «.» los
+# ganchos pre-mount tras encontrar el dispositivo raíz y antes de montarlo → ahí va guardian-early
+# (como guardian-early.service antes de sysroot.mount). El gancho no usa exit (lo lee el init).
+# Respaldo de la imagen; dracut -f SOLO para un kernel; verifica con lsinitrd (piezas, sumas, que
+# el init lea pre-mount); si algo falla, restaura la imagen y quita el módulo. Como el módulo queda
+# en dracut.conf.d, cada «dracut» posterior (p. ej. al actualizar el kernel con xbps) lo incluye.
+# Fase tardía: runit (/etc/sv/guardian-late, una vez por arranque) u OpenRC (/etc/init.d/guardian-late).
+# Uso: sudo bash instalar-dracut-sinsd [--kernel K] [--early ruta] [--guardian ruta]
+#      sudo bash instalar-dracut-sinsd /dev/sdXN --sistema-confiable [--kernel K] [--early …] [--guardian …]
+VERSION="1.0"
+set -u
+R="${GUARDIAN_ROOT:-}"
+KVER=""; EARLY=""; GUARD=""
+GEI=/usr/local/sbin/guardian-early
+MOD=/usr/lib/dracut/modules.d/70guardian-sinsd
+DCONF=/etc/dracut.conf.d/20-guardian-sinsd.conf
+CONF_DEFECTO='# Guardian early (initramfs). Se copia al initramfs con dracut.
+# ON_FAIL = qué hacer si la raíz tiene un daño que e2fsck -p no puede reparar:
+#   nada | solo_con_respaldo | respaldo_y_forzar | forzar
+# BACKUP_MIN_MB  = espacio libre mínimo (MB) de la partición de respaldo.
+# META_MIN_MB    = espacio libre mínimo (MB) para la imagen de METADATOS (e2image -r).
+# BACKUP_UUID    = (opcional) UUID de la ÚNICA partición donde guardar el respaldo; vacío = la primera con espacio.
+# BACKUP_EXCLUDE = (opcional) UUIDs separados por espacio de particiones que NUNCA se usan (p. ej. un disco que falla).
+# IMPORTANTE: tras editar este archivo ejecuta: sudo dracut -f
+ON_FAIL=respaldo_y_forzar
+BACKUP_MIN_MB=512
+META_MIN_MB=2048
+BACKUP_UUID=
+BACKUP_EXCLUDE='
+die() { echo "✖ $*" >&2; exit 1; }
+
+# >>> sinsd
+sinsd_modulo() { cat <<'MODULO'
+#!/bin/bash
+# Guardian early (instalar-dracut-sinsd): revisa la raiz ext4 antes de montarla. dracut SIN systemd:
+# un gancho pre-mount (lo lee el init de dracut tras encontrar la raiz y antes de montarla).
+check() {
+    [[ -x /usr/local/sbin/guardian-early ]] || return 255
+    require_binaries e2fsck blkid e2image || return 1
+    return 0
+}
+depends() { return 0; }
+installkernel() {
+    hostonly='' instmods ext4 vfat nls_cp437 nls_iso8859_1 nls_ascii nls_utf8
+}
+install() {
+    local p
+    inst_multiple e2fsck blkid e2image
+    inst_multiple -o cat mkdir rmdir readlink mount umount sleep sync date
+    inst_simple /usr/local/sbin/guardian-early /usr/bin/guardian-early
+    chmod 755 "${initdir}/usr/bin/guardian-early"
+    p=$(type -P df) && inst "$p" /usr/bin/guardian-df
+    [[ -f /etc/guardian/early.conf ]] \
+        && inst_simple /etc/guardian/early.conf /etc/guardian-early.conf
+    inst_hook pre-mount 10 "$moddir/guardian-early-hook.sh"
+}
+MODULO
+}
+sinsd_gancho() { cat <<'GANCHO'
+#!/bin/sh
+# Guardian early (dracut sin systemd). El init de dracut lee este archivo con «.»: sin exit.
+if [ -x /usr/bin/guardian-early ]; then
+    /usr/bin/guardian-early || :
+fi
+GANCHO
+}
+# 0 si el listado de lsinitrd ($1) es de un initramfs con systemd
+sinsd_es_systemd() {
+    grep -Eq 'initrd-root-fs\.target|(^|[[:space:]])(usr/)?lib/systemd/systemd([[:space:]]|$)' <<<"$1"
+}
+# Piezas (ERE sobre el listado de lsinitrd | nombre)
+PIEZAS=(
+ 'usr/bin/guardian-early$|usr/bin/guardian-early'
+ 'bin/e2fsck$|e2fsck'
+ 'bin/blkid$|blkid'
+ 'bin/e2image$|e2image'
+ 'usr/bin/guardian-df$|guardian-df'
+ 'dracut/hooks/pre-mount/[0-9]+-guardian-early-hook\.sh$|gancho pre-mount'
+ 'etc/guardian-early\.conf$|etc/guardian-early.conf'
+ 'bin/mount$|mount'
+ 'bin/umount$|umount'
+ 'bin/sync$|sync'
+)
+# $1 = imagen. Una línea por pieza; devuelve el nº de faltantes.
+sinsd_verificar() {
+    local img="$1" list p pat nom falta=0 a b gh ini
+    list=$(lsinitrd "$img" 2>/dev/null) || list=""
+    [[ -n "$list" ]] || { echo "  ✖ no se puede leer la imagen con lsinitrd"; return 99; }
+    if sinsd_es_systemd "$list"; then echo "  ✖ la imagen nueva es de systemd"; falta=$((falta + 1)); fi
+    for p in "${PIEZAS[@]}"; do
+        pat="${p%%|*}"; nom="${p#*|}"
+        if grep -Eq "$pat" <<<"$list"; then echo "  ✔ initramfs contiene $nom"
+        else echo "  ✖ initramfs NO contiene $nom"; falta=$((falta + 1)); fi
+    done
+    a=$(lsinitrd "$img" usr/bin/guardian-early 2>/dev/null | sha256sum | cut -d' ' -f1)
+    b=$(sha256sum < "$R$GEI" | cut -d' ' -f1)
+    if [[ "$a" == "$b" ]]; then echo "  ✔ guardian-early de dentro = el instalado"
+    else echo "  ✖ guardian-early de dentro NO coincide con el instalado"; falta=$((falta + 1)); fi
+    if [[ -f "$R/etc/guardian/early.conf" ]]; then
+        a=$(lsinitrd "$img" etc/guardian-early.conf 2>/dev/null | sha256sum | cut -d' ' -f1)
+        b=$(sha256sum < "$R/etc/guardian/early.conf" | cut -d' ' -f1)
+        if [[ "$a" == "$b" ]]; then echo "  ✔ early.conf de dentro = el instalado"
+        else echo "  ✖ early.conf de dentro NO coincide con el instalado"; falta=$((falta + 1)); fi
+    fi
+    gh=$(grep -oE '[^[:space:]]*dracut/hooks/pre-mount/[0-9]+-guardian-early-hook\.sh$' <<<"$list" | head -n 1)
+    if [[ -n "$gh" ]]; then
+        a=$(lsinitrd "$img" "$gh" 2>/dev/null | sha256sum | cut -d' ' -f1)
+        b=$(sinsd_gancho | sha256sum | cut -d' ' -f1)
+        if [[ "$a" == "$b" ]]; then echo "  ✔ gancho de dentro = el del módulo"
+        else echo "  ✖ gancho de dentro distinto"; falta=$((falta + 1)); fi
+    fi
+    ini=$(lsinitrd "$img" init 2>/dev/null)
+    if [[ -z "$ini" ]]; then echo "  ⚠ no pude leer el init de la imagen (no se comprueba pre-mount)"
+    elif grep -q 'pre-mount' <<<"$ini"; then echo "  ✔ el init de dracut lee los ganchos pre-mount"
+    else echo "  ✖ el init de la imagen NO lee pre-mount"; falta=$((falta + 1)); fi
+    return "$falta"
+}
+# Servicio runit: una vez por arranque (marca en /run); nunca falla; luego queda en pausa.
+sinsd_runit_run() { cat <<'RUNIT'
+#!/bin/sh
+# Guardian: fase tardía (instalar-dracut-sinsd). Una vez por arranque; nunca hace fallar nada.
+exec 2>&1
+M=/run/guardian-late.hecho
+if [ ! -e "$M" ]; then
+    : > "$M"
+    if [ -e /run/guardian.skip ]; then
+        echo "guardian.skip: no corro" > /var/log/guardian-late.log
+    else
+        timeout 300 /usr/lib/guardian/guardian --no-music --no-packages > /var/log/guardian-late.log 2>&1
+        echo "rc=$?" >> /var/log/guardian-late.log
+    fi
+fi
+command -v pause >/dev/null 2>&1 && exec pause
+exec sleep 2147483647
+RUNIT
+}
+sinsd_openrc() { cat <<'SERV'
+#!/sbin/openrc-run
+# Guardian: fase tardía (instalar-dracut-sinsd). Nunca hace fallar el arranque.
+description="Guardian: revisión tras arrancar (fase tardía)"
+depend() { need localmount; after bootmisc; }
+start() {
+    if [ -e /run/guardian.skip ]; then einfo "Guardian: guardian.skip, no corro"; return 0; fi
+    ebegin "Guardian (fase tardía)"
+    timeout 300 /usr/lib/guardian/guardian --no-music --no-packages > /var/log/guardian-late.log 2>&1
+    echo "rc=$?" >> /var/log/guardian-late.log
+    eend 0
+}
+SERV
+}
+sinsd_copia() {   # $1 → $2 salvo que sean el mismo archivo
+    [[ "$(readlink -f "$1" 2>/dev/null)" == "$(readlink -f "$2" 2>/dev/null || echo x)" ]] && return 0
+    install -m 0755 "$1" "$2"
+}
+# 4.19.1: guardian-actualizar (junto a guardian $1) → /usr/lib/guardian y /usr/local/sbin, como install-guardian.
+sinsd_actualizador() {
+    local a; a="$(dirname "$1")/guardian-actualizar"
+    [[ -f "$a" ]] || { echo "  ⚠ no hay guardian-actualizar junto a $1: no lo instalo"; return 0; }
+    install -d -m 0755 "$R/usr/lib/guardian" "$R/usr/local/sbin" || return 1
+    sinsd_copia "$a" "$R/usr/lib/guardian/guardian-actualizar" || return 1
+    sinsd_copia "$a" "$R/usr/local/sbin/guardian-actualizar" || return 1
+    echo "  ✔ guardian-actualizar (solo bundles firmados)"
+    local p falta=""
+    for p in xz ssh-keygen; do
+        [[ -x "$R/usr/bin/$p" || -x "$R/bin/$p" || -x "$R/usr/sbin/$p" ]] || falta+=" $p"
+    done
+    [[ -z "$falta" ]] || echo "  ⚠ guardian-actualizar necesitará:$falta (instálalo antes de actualizar)"
+    return 0
+}
+# Fase tardía. $1 = guardian. 0 también si no hay runit ni OpenRC (avisa).
+sinsd_tardia() {
+    local g="$1" s b
+    [[ -f "$g" ]] || { echo "  ⚠ no encuentro guardian ($g): no instalo la fase tardía"; return 0; }
+    if [[ -d "$R/etc/sv" ]] && { [[ -e "$R/usr/bin/runsvdir" || -e "$R/usr/sbin/runsvdir" || -e "$R/sbin/runsvdir" || -e "$R/bin/runsvdir" ]]; }; then
+        install -d -m 0755 "$R/usr/lib/guardian" "$R/etc/sv/guardian-late" || return 1
+        sinsd_copia "$g" "$R/usr/lib/guardian/guardian" || return 1
+        sinsd_actualizador "$g" || return 1
+        sinsd_runit_run > "$R/etc/sv/guardian-late/run" && chmod 0755 "$R/etc/sv/guardian-late/run" || return 1
+        # convención de Void: supervise → /run/runit/supervise.NOMBRE (si otros servicios la usan)
+        for s in "$R"/etc/sv/*/supervise; do
+            [[ -L "$s" && "$(readlink "$s")" == /run/runit/supervise.* ]] || continue
+            ln -sfn /run/runit/supervise.guardian-late "$R/etc/sv/guardian-late/supervise"; break
+        done
+        if [[ -d "$R/etc/runit/runsvdir/default" ]]; then b=/etc/runit/runsvdir/default
+        elif [[ -d "$R/var/service" && ! -L "$R/var/service" ]]; then b=/var/service
+        else b=/etc/service; install -d -m 0755 "$R$b" || return 1; fi
+        ln -sfn /etc/sv/guardian-late "$R$b/guardian-late" || return 1
+        echo "  ✔ fase tardía (runit): /etc/sv/guardian-late, enlace en $b"
+        return 0
+    fi
+    if [[ -d "$R/etc/init.d" ]] && { [[ -e "$R/sbin/openrc-run" || -e "$R/usr/sbin/openrc-run" || -e "$R/usr/bin/openrc-run" ]]; }; then
+        install -d -m 0755 "$R/usr/lib/guardian" "$R/etc/runlevels/default" || return 1
+        sinsd_copia "$g" "$R/usr/lib/guardian/guardian" || return 1
+        sinsd_actualizador "$g" || return 1
+        sinsd_openrc > "$R/etc/init.d/guardian-late" && chmod 0755 "$R/etc/init.d/guardian-late" || return 1
+        ln -sfn /etc/init.d/guardian-late "$R/etc/runlevels/default/guardian-late" || return 1
+        echo "  ✔ fase tardía (OpenRC): /etc/init.d/guardian-late (nivel default)"
+        return 0
+    fi
+    echo "  ⚠ sin runit ni OpenRC: no instalo la fase tardía (solo la early)"
+    return 0
+}
+# <<< sinsd
+
+# Modo disco: el sistema de OTRO disco (desmontado), en chroot. $1 = dispositivo, resto: opciones.
+sinsd_en_disco() {
+    local DEV=$1; shift
+    local conf=0 k="" e="" g=""
+    while (( $# )); do
+        case "$1" in
+            --sistema-confiable) conf=1; shift ;;
+            --kernel) k=$2; shift 2 ;;
+            --early) e=$2; shift 2 ;;
+            --guardian) g=$2; shift 2 ;;
+            *) die "Opción desconocida: $1" ;;
+        esac
+    done
+    [[ -b "$DEV" ]] || die "$DEV no es un dispositivo de bloques"
+    [[ $(id -u) -eq 0 ]] || die "Usa: sudo bash $0 $DEV --sistema-confiable"
+    (( conf == 1 )) || die "Instalar en otro disco requiere --sistema-confiable (el chroot EJECUTA programas de ese sistema)"
+    [[ -z "$(findmnt -rno TARGET -S "$DEV" 2>/dev/null)" ]] || die "$DEV está montado: desmóntalo antes"
+    local SRC; SRC=$(cd "$(dirname "$0")" && pwd)
+    [[ -n "$e" ]] || e=$SRC/guardian-early
+    [[ -n "$g" ]] || g=$SRC/guardian
+    [[ -f "$e" ]] || die "No encuentro guardian-early ($e)"
+    SD_MNT=$(mktemp -d /tmp/guardian-sinsd-disco.XXXXXX) || die "mktemp"
+    sd_soltar() {
+        local m
+        for m in $(findmnt -rn -o TARGET 2>/dev/null | grep -F "$SD_MNT" | sort -r); do umount "$m" 2>/dev/null || umount -l "$m"; done
+        rmdir "$SD_MNT" 2>/dev/null; return 0
+    }
+    trap sd_soltar EXIT
+    mount "$DEV" "$SD_MNT" || die "No pude montar $DEV"
+    [[ -x "$SD_MNT/usr/bin/dracut" || -x "$SD_MNT/usr/sbin/dracut" || -x "$SD_MNT/sbin/dracut" ]] || die "$DEV no tiene dracut"
+    [[ ! -e "$SD_MNT/usr/lib/systemd/systemd" ]] || die "$DEV usa systemd: usa instalar-dracut"
+    if [[ ! -x "$SD_MNT/bin/bash" && ! -x "$SD_MNT/usr/bin/bash" ]]; then
+        [[ -x "$SD_MNT/usr/bin/xbps-install" ]] || die "Ese sistema no tiene bash: instálalo y repite. No se tocó nada."
+        echo "→ Ese Void no tiene bash: lo instalo con su xbps (red)..."
+        mount --bind /dev "$SD_MNT/dev" && mount -t proc proc "$SD_MNT/proc" || die "Montajes para xbps"
+        local rs=""; [[ -e "$SD_MNT/etc/resolv.conf" ]] || { cp -L /etc/resolv.conf "$SD_MNT/etc/resolv.conf" 2>/dev/null && rs=1; }
+        chroot "$SD_MNT" /usr/bin/xbps-install -y bash </dev/null
+        [[ -n "$rs" ]] && rm -f "$SD_MNT/etc/resolv.conf"
+        umount "$SD_MNT/proc" "$SD_MNT/dev"
+        [[ -x "$SD_MNT/usr/bin/bash" ]] || die "No pude instalar bash (xbps-install bash): instálalo y repite. No se tocó Guardian."
+        echo "  ✔ bash instalado"
+    fi
+    local bs bd
+    bs=$(awk '$1 !~ /^#/ && $2 == "/boot" { print $1 }' "$SD_MNT/etc/fstab" 2>/dev/null | head -n 1)
+    if [[ -n "$bs" ]]; then
+        bd=$(findfs "$bs" 2>/dev/null || blkid -l -o device -t "$bs" 2>/dev/null)
+        [[ -b "$bd" ]] || die "Ese sistema tiene /boot aparte ($bs) y no lo encuentro"
+        mount "$bd" "$SD_MNT/boot" || die "No pude montar su /boot ($bd)"
+        echo "  (/boot aparte: $bd)"
+    fi
+    mount --bind /dev "$SD_MNT/dev" && mount --bind /dev/pts "$SD_MNT/dev/pts" \
+        && mount -t proc proc "$SD_MNT/proc" && mount -t sysfs sys "$SD_MNT/sys" || die "Montajes del chroot"
+    local D=/root/guardian-inst
+    install -d -m 0700 "$SD_MNT$D" && install -m 0755 "$0" "$SD_MNT$D/instalar-dracut-sinsd" \
+        && install -m 0755 "$e" "$SD_MNT$D/guardian-early" || die "No pude copiar el instalador"
+    [[ -f "$g" ]] && install -m 0755 "$g" "$SD_MNT$D/guardian"
+    [[ -f "$(dirname "$g")/guardian-actualizar" ]] && install -m 0755 "$(dirname "$g")/guardian-actualizar" "$SD_MNT$D/guardian-actualizar"
+    echo "→ Sistema en $DEV ($(grep -m1 '^PRETTY_NAME' "$SD_MNT/etc/os-release" 2>/dev/null | cut -d= -f2)): instalar-dracut-sinsd en chroot"
+    local rc=0
+    chroot "$SD_MNT" /usr/bin/env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin HOME=/root TERM=dumb \
+        /bin/bash "$D/instalar-dracut-sinsd" ${k:+--kernel "$k"} --early "$D/guardian-early" --guardian "$D/guardian" </dev/null || rc=$?
+    rm -rf "$SD_MNT$D"
+    sync; sd_soltar; trap - EXIT
+    return $rc
+}
+
+main() {
+    if [[ "${1:-}" == /dev/* ]]; then sinsd_en_disco "$@"; exit $?; fi
+    while (( $# )); do
+        case "$1" in
+            --kernel) KVER=$2; shift 2 ;;
+            --early)  EARLY=$2; shift 2 ;;
+            --guardian) GUARD=$2; shift 2 ;;
+            --interno) shift ;;
+            *) die "Opción desconocida: $1" ;;
+        esac
+    done
+    [[ $(id -u) -eq 0 || -n "$R" ]] || die "Usa: sudo bash $0"
+    command -v dracut   >/dev/null 2>&1 || die "Este sistema no tiene dracut"
+    command -v lsinitrd >/dev/null 2>&1 || die "Falta lsinitrd (viene con dracut)"
+    [[ -n "$EARLY" ]] || EARLY=$(cd "$(dirname "$0")" && pwd)/guardian-early
+    [[ -f "$EARLY" ]] || die "No encuentro guardian-early (usa --early ruta)"
+    [[ -n "$GUARD" ]] || GUARD=$(dirname "$EARLY")/guardian
+    local MD=/usr/lib/modules; [[ -d "$R$MD" ]] || MD=/lib/modules
+    local c k IMG=""
+    if [[ -z "$KVER" ]]; then
+        for k in $(ls -1 "$R$MD" 2>/dev/null | sort -V -r); do
+            if [[ -f "$R/boot/initramfs-$k.img" || -f "$R/boot/initrd-$k" ]]; then KVER=$k; break; fi
+        done
+    fi
+    [[ -n "$KVER" && -d "$R$MD/$KVER" ]] || die "No existe el kernel ${KVER:-?} en $MD"
+    for c in "$R/boot/initramfs-$KVER.img" "$R/boot/initrd-$KVER"; do [[ -f "$c" ]] && { IMG=$c; break; }; done
+    [[ -n "$IMG" ]] || die "No encuentro el initramfs de $KVER en /boot (¿/boot en otra partición sin montar?)"
+    echo "→ Kernel objetivo: $KVER   imagen: ${IMG#"$R"}"
+    local lst0; lst0=$(lsinitrd "$IMG" 2>/dev/null) || lst0=""
+    [[ -n "$lst0" ]] || die "No puedo leer ${IMG#"$R"} con lsinitrd (no se tocó nada)"
+    if sinsd_es_systemd "$lst0"; then
+        die "El initramfs actual es de systemd: usa instalar-dracut (no se tocó nada)"
+    fi
+
+    local BK="$R/var/backups/guardian-initrd" BKF
+    install -d -m 0700 "$BK" || die "No pude crear $BK"
+    BKF="$BK/$(basename "$IMG").$(date +%Y%m%d_%H%M%S)"
+    cp -a "$IMG" "$BKF" || die "No se pudo respaldar el initramfs"
+    echo "→ Respaldo del initramfs: ${BKF#"$R"}"
+    restaurar() {
+        echo "⚠ Restaurando el initramfs original y desactivando el módulo..."
+        cp -a "$BKF" "$IMG" && echo "  ✔ initramfs original restaurado" || echo "  ✖ NO se pudo restaurar; copia a mano: ${BKF#"$R"} → ${IMG#"$R"}"
+        rm -f "$R$DCONF"
+    }
+
+    install -d -m 0755 "$R/usr/local/sbin" "$R/etc/guardian" "$R/etc/dracut.conf.d" "$R$MOD" || die "No pude crear directorios"
+    sinsd_copia "$EARLY" "$R$GEI" || die "No pude instalar guardian-early"
+    echo "  ✔ $GEI"
+    if [[ ! -f "$R/etc/guardian/early.conf" ]]; then
+        printf '%s\n' "$CONF_DEFECTO" > "$R/etc/guardian/early.conf" && chmod 644 "$R/etc/guardian/early.conf"
+        echo "  ✔ /etc/guardian/early.conf (nuevo, con valores por defecto)"
+    else
+        echo "  ✔ /etc/guardian/early.conf ya existía: no se toca"
+    fi
+    { sinsd_modulo > "$R$MOD/module-setup.sh" && sinsd_gancho > "$R$MOD/guardian-early-hook.sh" \
+        && chmod 0755 "$R$MOD/module-setup.sh" "$R$MOD/guardian-early-hook.sh"; } || { restaurar; die "No pude escribir el módulo dracut"; }
+    printf '# Guardian early sin systemd (instalar-dracut-sinsd v%s)\nadd_dracutmodules+=" guardian-sinsd "\n' "$VERSION" > "$R$DCONF"
+    echo "  ✔ módulo 70guardian-sinsd y ${DCONF}"
+
+    echo "→ Regenerando el initramfs (solo kernel $KVER)..."
+    if ! dracut -f --kver "$KVER" "${IMG#"$R"}" </dev/null; then
+        echo "✖ dracut falló"; restaurar; exit 1
+    fi
+    local sz; sz=$(stat -c %s "$IMG" 2>/dev/null || echo 0)
+    if (( sz < ${GUARDIAN_MIN_IMG:-1000000} )); then echo "✖ El initramfs nuevo es sospechosamente pequeño ($sz bytes)"; restaurar; exit 1; fi
+    echo "  ✔ initramfs regenerado ($((sz / 1024)) KB)"
+    local out rc
+    out=$(sinsd_verificar "$IMG"); rc=$?
+    echo "$out"
+    if (( rc != 0 )); then echo "✖ La imagen nueva no trae todas las piezas ($rc faltan)"; restaurar; exit 1; fi
+    sinsd_tardia "$GUARD" || echo "  ⚠ no pude instalar la fase tardía (la early sí quedó)"
+    echo ""
+    echo "✅ Guardian early (dracut sin systemd) instalado para el kernel $KVER"
+    echo "   Respaldo del initramfs original: ${BKF#"$R"}"
+    echo "   Resultado tras reiniciar: cat /run/guardian/early_status ; cat /var/log/guardian-late.log"
+    echo "   Si cambias /etc/guardian/early.conf: sudo dracut -f --kver $KVER"
+}
+[[ "${GUARDIAN_SINSD_FUNCIONES:-0}" == 1 ]] || main "$@"

@@ -1,0 +1,348 @@
+#!/bin/bash
+# instalar-mkinitfs v1.7 (Guardian 4.18.0) — Guardian early en el initramfs de Alpine (mkinitfs).
+# mkinitfs no tiene ganchos: se usa una COPIA de su init (/usr/share/mkinitfs/initramfs-init) con la
+# llamada a guardian-early justo después del resume_from_disk del camino root= (vuelta de hibernación;
+# es el que va seguido de «if [ "$KOPT_overlaytmpfs" = "yes" ]») y antes de montar la raíz (el otro
+# resume_from_disk es el modo diskless, sin disco que revisar), y un feature «guardian» que mete guardian-early, e2fsck (+e2image) y early.conf.
+# mkinitfs.conf: features += guardian, init=/etc/guardian/mkinitfs/initramfs-init.
+# Respaldo de la imagen y de mkinitfs.conf; regenera; desempaqueta y verifica (piezas, suma, e2fsck
+# corre dentro con sus bibliotecas); si algo falla, restaura todo.
+# v1.3: gancho de apk (/etc/apk/commit_hooks.d/guardian-mkinitfs, post-commit): si apk cambia el init
+# original de mkinitfs, vuelve a correr este instalador (copiado en /usr/lib/guardian) para cada kernel.
+# v1.5: fase tardía con OpenRC: /usr/lib/guardian/guardian + /etc/init.d/guardian-late (nivel default):
+# como guardian-late.service (tras localmount, salvo /run/guardian.skip, --no-music --no-packages, 300 s);
+# nunca hace fallar el arranque; salida en /var/log/guardian-late.log.
+# v1.7: en modo disco, si ese Alpine no tiene bash lo instala con su apk (si no puede, se niega).
+# v1.6: modo disco (lo usa instalar-en-disco): instalar-mkinitfs /dev/X --sistema-confiable [...] monta ese
+# Alpine (y su /boot del fstab), chroot con /dev /proc /sys, se copia dentro y se corre ahí; limpia al final.
+# Uso: sudo bash instalar-mkinitfs [--kernel K] [--early ruta/guardian-early] [--guardian ruta/guardian]
+#      sudo bash instalar-mkinitfs /dev/sdXN --sistema-confiable [--kernel K] [--early …] [--guardian …]
+VERSION="1.7"
+set -u
+R="${GUARDIAN_ROOT:-}"
+KVER=""; EARLY=""; GUARD=""
+GE=/usr/lib/guardian/guardian-early
+INITC=/etc/guardian/mkinitfs/initramfs-init
+FEAT=/etc/mkinitfs/features.d/guardian.files
+HOOK=/etc/apk/commit_hooks.d/guardian-mkinitfs
+ORIGSUM=/etc/guardian/mkinitfs/origen.sha256
+CONF=/etc/mkinitfs/mkinitfs.conf
+CONF_DEFECTO='# Guardian early (instalar-mkinitfs): valores por defecto de guardian-early.
+# Ver early.conf de otra instalación para ON_FAIL, BACKUP_UUID, etc.'
+die() { echo "✖ $*" >&2; exit 1; }
+
+# >>> mkinitfs (4.18.0)
+# Copia del init con Guardian. $1 = init original  $2 = destino. 1 si el ancla no es única.
+# Ancla: la llamada a resume_from_disk cuya siguiente línea con texto abre el bloque overlaytmpfs
+# (camino root=, justo antes de montar la raíz).
+mkf_init_copia() {
+    local n
+    n=$(mkf_anclas "$1")
+    if [[ "$n" != 1 ]]; then
+        echo "✖ El init de mkinitfs tiene $n llamadas a resume_from_disk antes del montaje de root= (espero 1): no sé dónde poner Guardian. No se tocó nada." >&2
+        return 1
+    fi
+    awk -v ge="$GE" '
+        { L[NR] = $0 }
+        END {
+            for (i = 1; i <= NR; i++) {
+                print L[i]
+                if (L[i] ~ /^[[:space:]]*resume_from_disk[[:space:]]*$/) {
+                    j = i + 1; while (j <= NR && L[j] ~ /^[[:space:]]*$/) j++
+                    if (j <= NR && index(L[j], "KOPT_overlaytmpfs\" = \"yes\"") > 0) {
+                        s = L[i]; sub(/resume_from_disk.*/, "", s)
+                        print s "# >>> guardian (instalar-mkinitfs)"
+                        print s "# /run como tmpfs: el init lo mueve a la raíz y OpenRC lo conserva (early_status)"
+                        print s "grep -q \" /run \" /proc/mounts 2>/dev/null || mount -t tmpfs -o nosuid,nodev,mode=0755 run /run 2>/dev/null"
+                        print s "if [ -x " ge " ]; then"
+                        print s "\tGUARDIAN_EARLY_CONF=/etc/guardian/early.conf " ge " || :"
+                        print s "fi"
+                        print s "# <<< guardian"
+                    }
+                }
+            }
+        }' "$1" > "$2"
+}
+# Cuenta las anclas válidas de $1
+mkf_anclas() {
+    awk '{ L[NR] = $0 }
+        END { n = 0
+            for (i = 1; i <= NR; i++) if (L[i] ~ /^[[:space:]]*resume_from_disk[[:space:]]*$/) {
+                j = i + 1; while (j <= NR && L[j] ~ /^[[:space:]]*$/) j++
+                if (j <= NR && index(L[j], "KOPT_overlaytmpfs\" = \"yes\"") > 0) n++ }
+            print n }' "$1"
+}
+# mkinitfs.conf: añade «guardian» a features y pone init= a la copia. $1 = conf (se reescribe)
+mkf_conf() {
+    local t; t=$(mktemp) || return 1
+    awk -v ic="$INITC" '
+        /^[[:space:]]*features=/ {
+            v = $0; sub(/^[[:space:]]*features=/, "", v); gsub(/"/, "", v)
+            if ((" " v " ") !~ / guardian /) v = v " guardian"
+            sub(/^ +/, "", v); print "features=\"" v "\""; hf = 1; next }
+        /^[[:space:]]*#?[[:space:]]*init=/ { next }
+        { print }
+        END { if (!hf) print "features=\"base guardian\""; print "init=\"" ic "\"" }' "$1" > "$t" && cat "$t" > "$1"
+    local rc=$?; rm -f "$t"; return $rc
+}
+# Lista del feature (rutas reales del sistema). $1 = ruta de guardian-early dentro de R
+mkf_lista() {
+    local t p
+    echo "$GE"
+    for t in e2fsck e2image; do
+        if p=$(PATH="$R/usr/sbin:$R/sbin:$R/usr/bin:$R/bin" command -v "$t" 2>/dev/null); then
+            echo "${p#"$R"}"
+        elif [[ "$t" == e2image ]]; then
+            echo "  (sin e2image: no habrá imagen de metadatos; apk add e2fsprogs-extra)" >&2
+        else
+            return 1
+        fi
+    done
+    echo /etc/guardian/early.conf
+}
+# Desempaqueta la imagen $1 en $2 (gzip, zstd, xz, lz4 o sin comprimir)
+mkf_desempaquetar() {
+    local m; m=$(od -An -tx1 -N4 "$1" 2>/dev/null | tr -d ' \n')
+    mkdir -p "$2" || return 1
+    case "$m" in
+        1f8b*)     ( cd "$2" && gzip -dc  <"$1" | cpio -idm 2>/dev/null ) ;;
+        28b52ffd)  ( cd "$2" && zstd -dc  <"$1" | cpio -idm 2>/dev/null ) ;;
+        fd377a58)  ( cd "$2" && xz -dc    <"$1" | cpio -idm 2>/dev/null ) ;;
+        02214c18|04224d18) ( cd "$2" && lz4 -dc <"$1" | cpio -idm 2>/dev/null ) ;;
+        30373037)  ( cd "$2" && cpio -idm <"$1" 2>/dev/null ) ;;
+        *) return 1 ;;
+    esac
+    [[ -e "$2/init" ]]
+}
+# Copia guardian-early $1 a $2 salvo que sean el mismo archivo (desde el gancho de apk lo son).
+mkf_copia_early() {
+    [[ "$(readlink -f "$1" 2>/dev/null)" == "$(readlink -f "$2" 2>/dev/null || echo x)" ]] && return 0
+    install -m 0755 "$1" "$2"
+}
+# Fase tardía con OpenRC. $1 = guardian (programa). Imprime lo hecho; 0 también si no hay OpenRC (avisa).
+mkf_servicio() { cat <<'SERV'
+#!/sbin/openrc-run
+# Guardian: fase tardía (instalar-mkinitfs). Igual que guardian-late.service; nunca hace fallar el arranque.
+description="Guardian: revisión tras arrancar (fase tardía)"
+depend() { need localmount; after bootmisc; }
+start() {
+    if [ -e /run/guardian.skip ]; then einfo "Guardian: guardian.skip, no corro"; return 0; fi
+    ebegin "Guardian (fase tardía)"
+    timeout 300 /usr/lib/guardian/guardian --no-music --no-packages > /var/log/guardian-late.log 2>&1
+    echo "rc=$?" >> /var/log/guardian-late.log
+    eend 0
+}
+SERV
+}
+# 4.19.1: guardian-actualizar (junto a guardian $1) → /usr/lib/guardian y /usr/local/sbin, como install-guardian.
+mkf_actualizador() {
+    local a; a="$(dirname "$1")/guardian-actualizar"
+    [[ -f "$a" ]] || { echo "  ⚠ no hay guardian-actualizar junto a $1: no lo instalo"; return 0; }
+    install -d -m 0755 "$R/usr/lib/guardian" "$R/usr/local/sbin" || return 1
+    mkf_copia_early "$a" "$R/usr/lib/guardian/guardian-actualizar" || return 1
+    mkf_copia_early "$a" "$R/usr/local/sbin/guardian-actualizar" || return 1
+    echo "  ✔ guardian-actualizar (solo bundles firmados)"
+    local p falta=""
+    for p in xz ssh-keygen; do
+        [[ -x "$R/usr/bin/$p" || -x "$R/bin/$p" || -x "$R/usr/sbin/$p" ]] || falta+=" $p"
+    done
+    [[ -z "$falta" ]] || echo "  ⚠ guardian-actualizar necesitará:$falta (instálalo antes de actualizar)"
+    return 0
+}
+mkf_tardia() {
+    if [[ ! -d "$R/etc/init.d" ]] || [[ ! -e "$R/sbin/openrc-run" && ! -e "$R/usr/sbin/openrc-run" && ! -e "$R/usr/bin/openrc-run" ]]; then
+        echo "  ⚠ sin OpenRC: no instalo la fase tardía (solo la early)"; return 0
+    fi
+    [[ -f "$1" ]] || { echo "  ⚠ no encuentro guardian ($1): no instalo la fase tardía"; return 0; }
+    install -d -m 0755 "$R/usr/lib/guardian" "$R/etc/runlevels/default" || return 1
+    mkf_copia_early "$1" "$R/usr/lib/guardian/guardian" || return 1
+    mkf_actualizador "$1" || return 1
+    mkf_servicio > "$R/etc/init.d/guardian-late" && chmod 0755 "$R/etc/init.d/guardian-late" || return 1
+    ln -sfn /etc/init.d/guardian-late "$R/etc/runlevels/default/guardian-late" || return 1
+    echo "  ✔ fase tardía: /etc/init.d/guardian-late (nivel default) → /usr/lib/guardian/guardian"
+}
+# Gancho de apk (post-commit). Nunca falla (exit 0): un gancho que falla no debe romper apk.
+mkf_gancho() { cat <<'GANCHO'
+#!/bin/sh
+# Guardian (instalar-mkinitfs): si apk actualizó mkinitfs, rehace la copia del init con Guardian y
+# regenera el initramfs de cada kernel (con respaldo, verificación y restauración). Nunca falla.
+[ "${1:-}" = post-commit ] || exit 0
+R="${GUARDIAN_ROOT:-}"
+O="$R/usr/share/mkinitfs/initramfs-init"; C="$R/etc/guardian/mkinitfs/initramfs-init"
+H="$R/etc/guardian/mkinitfs/origen.sha256"; I="$R/usr/lib/guardian/instalar-mkinitfs"
+[ -f "$O" ] && [ -f "$C" ] || exit 0
+s=$(sha256sum "$O" 2>/dev/null | cut -d' ' -f1)
+[ -n "$s" ] && [ "$s" = "$(cat "$H" 2>/dev/null)" ] && exit 0
+echo "guardian: mkinitfs cambió el init; rehago la copia con Guardian"
+if ! command -v bash >/dev/null 2>&1 || [ ! -f "$I" ]; then
+    echo "guardian: AVISO: falta bash o $I; corre instalar-mkinitfs a mano"; exit 0
+fi
+n=0
+for d in "$R"/lib/modules/*; do
+    k=${d##*/}; [ -f "$R/boot/initramfs-${k##*-}" ] || continue
+    if bash "$I" --kernel "$k" --early "$R/usr/lib/guardian/guardian-early" --guardian "$R/usr/lib/guardian/guardian"; then n=$((n+1))
+    else echo "guardian: AVISO: instalar-mkinitfs falló para $k (se restauró la imagen anterior)"; fi
+done
+echo "guardian: $n kernel(s) regenerados con Guardian"
+exit 0
+GANCHO
+}
+# <<< mkinitfs
+
+# Modo disco: instalar en el Alpine de OTRO disco (desmontado), en chroot. $1 = dispositivo, resto: opciones.
+mkf_en_disco() {
+    local DEV=$1; shift
+    local conf=0 k="" e="" g="" a
+    while (( $# )); do
+        case "$1" in
+            --sistema-confiable) conf=1; shift ;;
+            --kernel) k=$2; shift 2 ;;
+            --early) e=$2; shift 2 ;;
+            --guardian) g=$2; shift 2 ;;
+            *) die "Opción desconocida: $1" ;;
+        esac
+    done
+    [[ -b "$DEV" ]] || die "$DEV no es un dispositivo de bloques"
+    [[ $(id -u) -eq 0 ]] || die "Usa: sudo bash $0 $DEV --sistema-confiable"
+    (( conf == 1 )) || die "Instalar en otro disco requiere --sistema-confiable (como instalar-en-disco)"
+    [[ -z "$(findmnt -rno TARGET -S "$DEV" 2>/dev/null)" ]] || die "$DEV está montado: desmóntalo antes"
+    local SRC; SRC=$(cd "$(dirname "$0")" && pwd)
+    [[ -n "$e" ]] || e=$SRC/guardian-early
+    [[ -n "$g" ]] || g=$SRC/guardian
+    [[ -f "$e" ]] || die "No encuentro guardian-early ($e)"
+    MKF_MNT=$(mktemp -d /tmp/guardian-mkf-disco.XXXXXX) || die "mktemp"
+    mkf_soltar() {
+        local m
+        for m in $(findmnt -rn -o TARGET 2>/dev/null | grep -F "$MKF_MNT" | sort -r); do umount "$m" 2>/dev/null || umount -l "$m"; done
+        rmdir "$MKF_MNT" 2>/dev/null; return 0
+    }
+    trap mkf_soltar EXIT
+    mount "$DEV" "$MKF_MNT" || die "No pude montar $DEV"
+    [[ -x "$MKF_MNT/sbin/mkinitfs" || -x "$MKF_MNT/usr/sbin/mkinitfs" ]] || die "$DEV no tiene mkinitfs (¿no es Alpine?)"
+    if [[ ! -x "$MKF_MNT/bin/bash" && ! -x "$MKF_MNT/usr/bin/bash" ]]; then
+        # v1.7: sin bash, se instala con el apk de ese Alpine (necesita red); si no se puede, no se toca nada más
+        echo "→ Ese Alpine no tiene bash: lo instalo con su apk (red)..."
+        mount --bind /dev "$MKF_MNT/dev" && mount -t proc proc "$MKF_MNT/proc" || die "Montajes para apk"
+        local rs=""; [[ -e "$MKF_MNT/etc/resolv.conf" ]] || { cp -L /etc/resolv.conf "$MKF_MNT/etc/resolv.conf" 2>/dev/null && rs=1; }
+        chroot "$MKF_MNT" /sbin/apk add --no-progress bash </dev/null || chroot "$MKF_MNT" /usr/sbin/apk add --no-progress bash </dev/null
+        [[ -n "$rs" ]] && rm -f "$MKF_MNT/etc/resolv.conf"
+        umount "$MKF_MNT/proc" "$MKF_MNT/dev"
+        [[ -x "$MKF_MNT/bin/bash" || -x "$MKF_MNT/usr/bin/bash" ]] || die "Ese Alpine no tiene bash y no pude instalarlo (apk add bash): instálalo y repite. No se tocó Guardian."
+        echo "  ✔ bash instalado en ese Alpine"
+    fi
+    local bs bd
+    bs=$(awk '$1 !~ /^#/ && $2 == "/boot" { print $1 }' "$MKF_MNT/etc/fstab" 2>/dev/null | head -n 1)
+    if [[ -n "$bs" ]]; then
+        bd=$(findfs "$bs" 2>/dev/null || blkid -l -o device -t "$bs" 2>/dev/null)
+        [[ -b "$bd" ]] || die "Ese Alpine tiene /boot aparte ($bs) y no lo encuentro"
+        mount "$bd" "$MKF_MNT/boot" || die "No pude montar su /boot ($bd)"
+        echo "  (/boot aparte: $bd)"
+    fi
+    mount --bind /dev "$MKF_MNT/dev" && mount --bind /dev/pts "$MKF_MNT/dev/pts" \
+        && mount -t proc proc "$MKF_MNT/proc" && mount -t sysfs sys "$MKF_MNT/sys" || die "Montajes del chroot"
+    local D=/root/guardian-inst
+    install -d -m 0700 "$MKF_MNT$D" && install -m 0755 "$0" "$MKF_MNT$D/instalar-mkinitfs" \
+        && install -m 0755 "$e" "$MKF_MNT$D/guardian-early" || die "No pude copiar el instalador"
+    [[ -f "$g" ]] && install -m 0755 "$g" "$MKF_MNT$D/guardian"
+    [[ -f "$(dirname "$g")/guardian-actualizar" ]] && install -m 0755 "$(dirname "$g")/guardian-actualizar" "$MKF_MNT$D/guardian-actualizar"
+    echo "→ Alpine en $DEV: instalar-mkinitfs en chroot"
+    local rc=0
+    chroot "$MKF_MNT" /usr/bin/env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin HOME=/root TERM=dumb \
+        /bin/bash "$D/instalar-mkinitfs" ${k:+--kernel "$k"} --early "$D/guardian-early" --guardian "$D/guardian" </dev/null || rc=$?
+    rm -rf "$MKF_MNT$D"
+    sync; mkf_soltar; trap - EXIT
+    return $rc
+}
+
+main() {
+    if [[ "${1:-}" == /dev/* ]]; then mkf_en_disco "$@"; exit $?; fi
+    while (( $# )); do
+        case "$1" in
+            --kernel) KVER=$2; shift 2 ;;
+            --early)  EARLY=$2; shift 2 ;;
+            --guardian) GUARD=$2; shift 2 ;;
+            --interno) shift ;;
+            *) die "Opción desconocida: $1" ;;
+        esac
+    done
+    [[ $(id -u) -eq 0 || -n "$R" ]] || die "Usa: sudo bash $0"
+    command -v mkinitfs >/dev/null 2>&1 || die "Este sistema no tiene mkinitfs (¿no es Alpine?)"
+    local ORIG="$R/usr/share/mkinitfs/initramfs-init"
+    [[ -f "$ORIG" ]] || die "No encuentro $ORIG"
+    [[ -f "$R$CONF" ]] || die "No encuentro $CONF"
+    [[ -n "$EARLY" ]] || EARLY=$(cd "$(dirname "$0")" && pwd)/guardian-early
+    [[ -f "$EARLY" ]] || die "No encuentro guardian-early (usa --early ruta)"
+    [[ -n "$GUARD" ]] || GUARD=$(dirname "$EARLY")/guardian
+    if [[ -z "$KVER" ]]; then KVER=$(ls -1 "$R/lib/modules" 2>/dev/null | sort -V | tail -n 1); fi
+    [[ -n "$KVER" && -d "$R/lib/modules/$KVER" ]] || die "No existe el kernel ${KVER:-?} en /lib/modules"
+    local FL="${KVER##*-}" IMG
+    IMG="$R/boot/initramfs-$FL"
+    [[ -f "$IMG" ]] || die "No encuentro ${IMG#"$R"} (kernel $KVER, sabor $FL)"
+    echo "→ Kernel objetivo: $KVER   imagen: ${IMG#"$R"}"
+    local LST; LST=$(mkf_lista) || die "Falta e2fsck (apk add e2fsprogs): no se tocó nada"
+
+    local BK="$R/var/backups/guardian-initrd" SELLO; SELLO=$(date +%Y%m%d_%H%M%S)
+    install -d -m 0700 "$BK" || die "No pude crear $BK"
+    local BKF="$BK/$(basename "$IMG").$SELLO" BKC="$BK/mkinitfs.conf.$SELLO"
+    cp -a "$IMG" "$BKF" && cp -a "$R$CONF" "$BKC" || die "No se pudo respaldar la imagen o mkinitfs.conf"
+    local BKFE=""; [[ -f "$R$FEAT" ]] && { BKFE="$BK/guardian.files.$SELLO"; cp -a "$R$FEAT" "$BKFE"; }
+    echo "→ Respaldo: ${BKF#"$R"} y ${BKC#"$R"}"
+    restaurar() {
+        echo "⚠ Restaurando la imagen, mkinitfs.conf y el feature..."
+        cp -a "$BKF" "$IMG" && cp -a "$BKC" "$R$CONF" && echo "  ✔ restaurado" || echo "  ✖ NO se pudo restaurar; copia a mano desde ${BK#"$R"}"
+        if [[ -n "$BKFE" ]]; then cp -a "$BKFE" "$R$FEAT"; else rm -f "$R$FEAT"; fi
+    }
+
+    install -d -m 0755 "$R${GE%/*}" "$R/etc/guardian" "$R${INITC%/*}" "$R${FEAT%/*}" || { restaurar; die "No pude crear directorios"; }
+    mkf_copia_early "$EARLY" "$R$GE" || { restaurar; die "No pude instalar guardian-early"; }
+    echo "  ✔ $GE"
+    if [[ ! -f "$R/etc/guardian/early.conf" ]]; then
+        printf '%s\n' "$CONF_DEFECTO" > "$R/etc/guardian/early.conf" && chmod 644 "$R/etc/guardian/early.conf"
+        echo "  ✔ /etc/guardian/early.conf (nuevo, con valores por defecto)"
+    else
+        echo "  ✔ /etc/guardian/early.conf ya existía: no se toca"
+    fi
+    mkf_init_copia "$ORIG" "$R$INITC" || { restaurar; die "No se tocó la imagen"; }
+    chmod 0755 "$R$INITC"
+    sh -n "$R$INITC" || { restaurar; die "La copia del init no pasa sh -n"; }
+    printf '%s\n' "$LST" > "$R$FEAT"
+    mkf_conf "$R$CONF" || { restaurar; die "No pude editar mkinitfs.conf"; }
+    echo "  ✔ ${INITC} (init con Guardian), ${FEAT}, mkinitfs.conf"
+
+    echo "→ Regenerando el initramfs (solo kernel $KVER)..."
+    local rc=0
+    mkinitfs -c "$R$CONF" -o "$IMG" "$KVER" </dev/null || rc=$?
+    if (( rc != 0 )); then echo "✖ mkinitfs falló ($rc)"; restaurar; exit 1; fi
+    local sz; sz=$(stat -c %s "$IMG" 2>/dev/null || echo 0)
+    if (( sz < ${GUARDIAN_MIN_IMG:-1000000} )); then echo "✖ La imagen nueva es sospechosamente pequeña ($sz bytes)"; restaurar; exit 1; fi
+
+    local T; T=$(mktemp -d "${TMPDIR:-/tmp}/guardian-mkf.XXXXXX") || { restaurar; die "mktemp"; }
+    local falta=0 p
+    if ! mkf_desempaquetar "$IMG" "$T/x"; then echo "✖ No pude desempaquetar la imagen nueva"; rm -rf "$T"; restaurar; exit 1; fi
+    grep -q '^[[:space:]]*# >>> guardian (instalar-mkinitfs)' "$T/x/init" || { echo "  ✖ el init de la imagen no llama a Guardian"; falta=$((falta+1)); }
+    for p in $LST; do [[ -e "$T/x$p" ]] || { echo "  ✖ falta $p en la imagen"; falta=$((falta+1)); }; done
+    cmp -s "$T/x$GE" "$EARLY" || { echo "  ✖ guardian-early de la imagen no es el instalado"; falta=$((falta+1)); }
+    local E2; E2=$(grep -m1 '/e2fsck$' <<<"$LST")
+    if [[ -n "$E2" && -x "$T/x/bin/busybox" ]] && command -v chroot >/dev/null 2>&1; then
+        chroot "$T/x" "$E2" -V >/dev/null 2>&1 || { echo "  ✖ e2fsck no corre dentro de la imagen (¿bibliotecas?)"; falta=$((falta+1)); }
+    fi
+    rm -rf "$T"
+    if (( falta > 0 )); then echo "✖ La imagen nueva no trae todas las piezas ($falta faltan)"; restaurar; exit 1; fi
+    echo "  ✔ imagen verificada ($((sz / 1024)) KB): init con Guardian, guardian-early, e2fsck, early.conf"
+    mkf_tardia "$GUARD" || echo "  ⚠ no pude instalar la fase tardía (la early sí quedó)"
+    sha256sum "$ORIG" | cut -d' ' -f1 > "$R$ORIGSUM"
+    local yo; yo=$(readlink -f "$0" 2>/dev/null)
+    if [[ -f "$yo" && "$yo" != "$(readlink -f "$R/usr/lib/guardian/instalar-mkinitfs" 2>/dev/null)" ]]; then
+        install -m 0755 "$yo" "$R/usr/lib/guardian/instalar-mkinitfs"
+    fi
+    install -d -m 0755 "$R${HOOK%/*}" && mkf_gancho > "$R$HOOK" && chmod 0755 "$R$HOOK" \
+        && echo "  ✔ gancho de apk ${HOOK} (rehace la copia si apk actualiza mkinitfs)" \
+        || echo "  ⚠ no pude dejar el gancho de apk (tras actualizar mkinitfs, corre este instalador a mano)"
+
+    echo ""
+    echo "✅ Guardian early (mkinitfs) instalado para el kernel $KVER"
+    echo "   Respaldo de la imagen original: ${BKF#"$R"}   (mkinitfs.conf: ${BKC#"$R"})"
+    echo "   Si apk actualiza mkinitfs, el gancho ${HOOK} rehace la copia del init y regenera."
+    echo "   Si cambias /etc/guardian/early.conf: sudo mkinitfs $KVER"
+}
+[[ "${GUARDIAN_MKF_FUNCIONES:-0}" == 1 ]] || main "$@"

@@ -1,0 +1,340 @@
+#!/bin/bash
+# Instala Guardian en OTRO sistema Debian/Ubuntu o Arch (el disco NO debe ser el que está en uso).
+# Uso: sudo bash instalar-en-disco /dev/sdc2 --sistema-confiable
+# AVISO: el chroot EJECUTA programas de ese sistema como root. Si pudiera estar
+#   infectado, NO lo uses: por eso exige --sistema-confiable de forma explicita.
+# Hace: monta el disco, copia Guardian, entra con chroot y corre el instalador
+#   (Debian/Ubuntu: solo para el kernel que ese sistema arranca por defecto;
+#    Arch: mkinitcpio -P, todas las imágenes de los presets).
+# Si algo sale mal, restaura el initramfs. NO toca GRUB, ni fstab, ni datos del usuario.
+set -uo pipefail
+SRC="$(cd "$(dirname "$0")" && pwd)"
+DEV=""; TRUST=0
+for a in "$@"; do case "$a" in --sistema-confiable) TRUST=1 ;; /dev/*) DEV="$a" ;; esac; done
+MNT=/mnt/guardian-target
+BK=/var/backups/guardian-initrd
+RESTORE=""
+
+die() { echo "✖ $*"; exit 1; }
+[[ $(id -u) -eq 0 ]] || die "Usa: sudo bash $0 /dev/sdXN"
+[[ -b "$DEV" ]] || die "Uso: sudo bash $0 /dev/sdc2 --sistema-confiable   (el dispositivo no existe)"
+if (( TRUST != 1 )); then
+    echo "⛔ Este script entra a $DEV con chroot y EJECUTA programas de ese sistema como root,"
+    echo "   con acceso a todos tus discos. Si ese sistema pudiera estar infectado, NO lo hagas."
+    echo "   Solo si estas seguro de que esta limpio, repite añadiendo:  --sistema-confiable"
+    exit 2
+fi
+for f in guardian guardian-early install-guardian; do [[ -f "$SRC/$f" ]] || die "Falta $SRC/$f"; done
+
+# No instalar sobre el sistema en uso
+cur=$(readlink -f "$(findmnt -n -o SOURCE / )")
+[[ "$(readlink -f "$DEV")" != "$cur" ]] || die "$DEV es el sistema que estás usando. Para eso usa install-guardian."
+
+FSTIPO=$(blkid -o value -s TYPE "$DEV" 2>/dev/null)
+case "$FSTIPO" in ext3|ext4|btrfs|xfs) ;; *) die "$DEV no es ext3/ext4/btrfs/xfs (es '${FSTIPO:-?}')" ;; esac
+
+# Desmontar si el escritorio lo montó solo
+while read -r t; do
+    [[ -n "$t" ]] || continue
+    echo "→ Desmontando $t ..."
+    umount "$t" || die "No se pudo desmontar $t (cierra Dolphin/terminales que lo usen y repite)"
+done < <(findmnt -rn -S "$DEV" -o TARGET)
+
+if [[ "$FSTIPO" == btrfs || "$FSTIPO" == xfs ]]; then state=clean   # btrfs/xfs: el montaje reproduce el log
+else state=$(dumpe2fs -h "$DEV" 2>/dev/null </dev/null | awk -F': *' '/^Filesystem state/{print $2}'); fi
+[[ "$state" == clean ]] || die "$DEV no está 'clean' (estado: ${state:-?}). Ejecuta antes:  sudo e2fsck -p $DEV"
+
+SUBVOLS_MONTADOS=()   # (4.17.2) subvolúmenes btrfs montados por montar_subvols_fstab
+cleanup() {
+    for m in run dev/pts dev proc sys; do mountpoint -q "$MNT/$m" 2>/dev/null && umount -l "$MNT/$m" 2>/dev/null; done
+    local i   # (4.17.2) subvolúmenes del fstab, en orden inverso
+    for (( i=${#SUBVOLS_MONTADOS[@]}-1; i>=0; i-- )); do
+        umount "${SUBVOLS_MONTADOS[i]}" 2>/dev/null || umount -l "${SUBVOLS_MONTADOS[i]}" 2>/dev/null
+    done
+    if mountpoint -q "$MNT" 2>/dev/null; then umount "$MNT" 2>/dev/null || echo "⚠ No se pudo desmontar $MNT (revisa con: findmnt $MNT)"; fi
+}
+trap cleanup EXIT
+
+mkdir -p "$MNT"
+mount "$DEV" "$MNT" || die "No se pudo montar $DEV"
+# >>> (4.17.3) btrfs: si el subvolumen por defecto no es un sistema, buscar la raíz en un
+# subvolumen (Fedora subvol=root, Ubuntu/Arch @). Vale solo si su /etc/fstab dice que "/" es
+# ESE subvolumen de este mismo disco, y si hay exactamente uno.
+raiz_subvol_btrfs() {
+    [[ -f "$MNT/etc/os-release" ]] && return 0
+    local ruuid c sv spec mp tipo opts resto o hall=()
+    ruuid=$(blkid -s UUID -o value "$DEV" 2>/dev/null </dev/null)
+    [[ -n "$ruuid" ]] || { echo "  ⚠ $DEV sin UUID: no busco la raíz en subvolúmenes"; return 0; }
+    for c in @ root @root rootfs @rootfs; do
+        [[ -d "$MNT/$c" && ! -L "$MNT/$c" && -f "$MNT/$c/etc/os-release" && -f "$MNT/$c/etc/fstab" ]] || continue
+        sv=""
+        while read -r spec mp tipo opts resto; do
+            [[ "$mp" == / && "$tipo" == btrfs ]] || continue
+            case "$spec" in "UUID=$ruuid"|"/dev/disk/by-uuid/$ruuid"|"$DEV") ;; *) continue ;; esac
+            case ",$opts," in *,subvol=*) o=",$opts"; sv=${o#*,subvol=}; sv=${sv%%,*}; sv=${sv#/} ;; esac
+        done <"$MNT/$c/etc/fstab"
+        [[ "$sv" == "$c" ]] && hall+=("$c")
+    done
+    if (( ${#hall[@]} != 1 )); then
+        echo "  ⚠ btrfs: el subvolumen por defecto no es un sistema y no hay una raíz única en subvolúmenes (${#hall[@]})"
+        return 0
+    fi
+    umount "$MNT" || die "No pude desmontar $MNT para montar la raíz ${hall[0]}"
+    mount -o "subvol=${hall[0]}" "$DEV" "$MNT" </dev/null || die "No se pudo montar el subvolumen ${hall[0]} de $DEV"
+    echo "  ✔ Raíz en el subvolumen ${hall[0]} (no es el de por defecto)"
+    return 0
+}
+if [[ "$FSTIPO" == btrfs ]]; then raiz_subvol_btrfs; fi
+# <<< (4.17.3)
+# >>> (4.17.2) btrfs: montar también los subvolúmenes que lista el fstab del destino
+# (/var, /usr/local, /root...), para que la fase tardía escriba donde el sistema mira.
+montar_subvols_fstab() {
+    local ruuid spec mp tipo opts resto o sv prof l lista=()
+    ruuid=$(blkid -s UUID -o value "$DEV" 2>/dev/null </dev/null)
+    [[ -n "$ruuid" ]] || { echo "  ⚠ $DEV sin UUID: no se montan subvolúmenes"; return 0; }
+    while read -r spec mp tipo opts resto; do
+        [[ -z "$spec" || "$spec" == \#* ]] && continue
+        [[ "$tipo" == btrfs && "$mp" == /?* ]] || continue
+        case "$spec" in
+            "UUID=$ruuid"|"/dev/disk/by-uuid/$ruuid"|"$DEV") ;;
+            *) continue ;;
+        esac
+        case ",$opts," in *,noauto,*) continue ;; esac
+        case ",$opts," in *,subvol=*) ;; *) continue ;; esac
+        o=",$opts"; sv=${o#*,subvol=}; sv=${sv%%,*}
+        [[ -n "$sv" ]] || continue
+        prof=${mp//[!\/]/}
+        lista+=("${#prof} $mp $sv")
+    done <"$MNT/etc/fstab"
+    (( ${#lista[@]} )) || return 0
+    while read -r prof mp sv; do
+        [[ -n "$mp" ]] || continue
+        if [[ -L "$MNT$mp" || ! -d "$MNT$mp" ]]; then
+            echo "  ⚠ $mp no es un directorio en el destino: no se monta"; continue
+        fi
+        mountpoint -q "$MNT$mp" 2>/dev/null && continue
+        if mount -o "subvol=$sv" "$DEV" "$MNT$mp" </dev/null; then
+            SUBVOLS_MONTADOS+=("$MNT$mp"); echo "  ✔ Subvolumen $sv montado en $mp"
+        else
+            echo "  ⚠ No se pudo montar el subvolumen $sv en $mp (sigo)"
+        fi
+    done < <(printf '%s\n' "${lista[@]}" | sort -s -n -k1,1)
+    return 0
+}
+if [[ "$FSTIPO" == btrfs && -f "$MNT/etc/fstab" ]]; then
+    montar_subvols_fstab
+fi
+# <<< (4.17.2)
+# >>> (4.17.4) /boot en otra partición (Fedora, LVM/LUKS, ESP en /boot): montarla desde el
+# fstab del destino para que el initramfs nuevo (y su respaldo) quede donde arranca el equipo.
+montar_boot_fstab() {
+    local spec mp tipo opts resto d o sv pk1 pk2 st n=0 l=""
+    [[ -f "$MNT/etc/fstab" ]] || return 0
+    while read -r spec mp tipo opts resto; do
+        [[ -z "$spec" || "$spec" == \#* ]] && continue
+        [[ "$mp" == /boot ]] || continue
+        n=$((n + 1)); l="$spec $tipo $opts"
+    done <"$MNT/etc/fstab"
+    if (( n != 1 )); then
+        (( n > 1 )) && echo "  ⚠ el fstab del destino tiene $n líneas para /boot: no se monta"
+        return 0
+    fi
+    read -r spec tipo opts <<<"$l"
+    case ",$opts," in *,noauto,*) echo "  ⚠ /boot es noauto en el fstab: no se monta"; return 0 ;; esac
+    case "$tipo" in ext2|ext3|ext4|xfs|btrfs|vfat) ;; *) echo "  ⚠ /boot es '$tipo': no se monta"; return 0 ;; esac
+    case "$spec" in
+        UUID=*)     d=$(blkid -U "${spec#UUID=}" 2>/dev/null </dev/null) ;;
+        LABEL=*)    d=$(blkid -L "${spec#LABEL=}" 2>/dev/null </dev/null) ;;
+        PARTUUID=*) d=/dev/disk/by-partuuid/${spec#PARTUUID=} ;;
+        /dev/*)     d=$spec ;;
+        *)          echo "  ⚠ /boot con '$spec': no sé encontrarlo"; return 0 ;;
+    esac
+    [[ -n "$d" ]] && d=$(readlink -f "$d" 2>/dev/null)
+    if [[ -z "$d" ]] || ! test -b "$d"; then
+        echo "  ⚠ no encuentro el dispositivo de /boot ($spec): no se monta"; return 0
+    fi
+    [[ "$d" == "$(readlink -f "$DEV" 2>/dev/null)" ]] && return 0   # mismo dispositivo: subvolúmenes
+    if findmnt -rn -S "$d" -o TARGET 2>/dev/null </dev/null | grep -qxE '/|/boot|/boot/efi|/efi'; then
+        echo "  ⚠ $d está montado en ESTE equipo como raíz o /boot: no se toca"; return 0
+    fi
+    pk1=$(lsblk -lnso NAME,TYPE "$d" 2>/dev/null </dev/null | awk '$2=="disk"{print $1; exit}'); pk2=$(lsblk -lnso NAME,TYPE "$DEV" 2>/dev/null </dev/null | awk '$2=="disk"{print $1; exit}')   # (4.17.7) disco físico, también bajo LVM/LUKS
+    if [[ -n "$pk1" && -n "$pk2" && "$pk1" != "$pk2" ]]; then
+        echo "  ⚠ /boot ($d) está en otro disco que $DEV: no se monta"; return 0
+    fi
+    case "$tipo" in ext2|ext3|ext4)
+        st=$(dumpe2fs -h "$d" 2>/dev/null </dev/null | awk -F': *' '/^Filesystem state/{print $2}')
+        if [[ "$st" != clean ]] || dumpe2fs -h "$d" 2>/dev/null </dev/null | grep -q needs_recovery; then
+            echo "  ⚠ /boot ($d) no está limpio: ejecuta antes  sudo e2fsck -p $d  (no se monta)"; return 0
+        fi ;;
+    esac
+    if [[ -L "$MNT/boot" || ! -d "$MNT/boot" ]]; then
+        echo "  ⚠ /boot no es un directorio en el destino: no se monta"; return 0
+    fi
+    mountpoint -q "$MNT/boot" 2>/dev/null && return 0
+    o=""
+    case ",$opts," in *,subvol=*) o=",$opts"; sv=${o#*,subvol=}; sv=${sv%%,*}; o="subvol=$sv" ;; esac
+    if mount ${o:+-o "$o"} -t "$tipo" "$d" "$MNT/boot" </dev/null; then
+        SUBVOLS_MONTADOS+=("$MNT/boot"); echo "  ✔ /boot ($d, $tipo) montado"
+    else
+        echo "  ⚠ No se pudo montar /boot ($d) (sigo)"
+    fi
+    return 0
+}
+montar_boot_fstab
+# <<< (4.17.4)
+
+# (4.18.6) MiniOS: la partición es de DATOS (/minios/*.sb), no una raíz: lo instala instalar-minios
+if [[ ! -f "$MNT/etc/os-release" && -d "$MNT/minios/boot" ]] && ls "$MNT"/minios/*.sb >/dev/null 2>&1; then
+    [[ -f "$SRC/instalar-minios" ]] || die "Falta $SRC/instalar-minios"
+    echo "→ Partición de datos de MiniOS: se continúa con instalar-minios"
+    cleanup; trap - EXIT
+    exec /bin/bash "$SRC/instalar-minios" "$DEV" --sistema-confiable --early "$SRC/guardian-early" --guardian "$SRC/guardian"
+fi
+[[ -f "$MNT/etc/os-release" ]] || die "No parece un sistema Linux (falta /etc/os-release)"
+echo "→ Sistema encontrado: $(grep -m1 PRETTY_NAME "$MNT/etc/os-release")"
+TIPO=""
+if [[ -d "$MNT/etc/initramfs-tools" ]]; then TIPO=debian
+elif [[ -f "$MNT/etc/mkinitcpio.conf" && -x "$MNT/usr/bin/mkinitcpio" ]]; then TIPO=arch
+elif [[ -x "$MNT/sbin/mkinitfs" || -x "$MNT/usr/sbin/mkinitfs" ]]; then
+    # mkinitfs (Alpine): lo instala instalar-mkinitfs en ese disco, en chroot (4.18.0)
+    [[ -f "$SRC/instalar-mkinitfs" ]] || die "Falta $SRC/instalar-mkinitfs"
+    echo "→ Sistema con mkinitfs (Alpine): se continúa con instalar-mkinitfs"
+    cleanup; trap - EXIT
+    exec /bin/bash "$SRC/instalar-mkinitfs" "$DEV" --sistema-confiable --early "$SRC/guardian-early" --guardian "$SRC/guardian"
+elif [[ -x "$MNT/usr/bin/dracut" || -x "$MNT/usr/sbin/dracut" || -x "$MNT/sbin/dracut" ]] && ! [[ -e "$MNT/usr/lib/systemd/systemd" ]]; then
+    # dracut SIN systemd (Void con runit, Gentoo con OpenRC): instalar-dracut-sinsd en ese disco (4.18.1)
+    [[ -f "$SRC/instalar-dracut-sinsd" ]] || die "Falta $SRC/instalar-dracut-sinsd"
+    echo "→ Sistema con dracut sin systemd: se continúa con instalar-dracut-sinsd"
+    cleanup; trap - EXIT
+    exec /bin/bash "$SRC/instalar-dracut-sinsd" "$DEV" --sistema-confiable --early "$SRC/guardian-early" --guardian "$SRC/guardian"
+elif [[ -x "$MNT/usr/bin/dracut" ]]; then
+    # dracut (Fedora, openSUSE...): lo instala instalar-dracut (mismos argumentos)
+    [[ -f "$SRC/instalar-dracut" ]] || die "Falta $SRC/instalar-dracut"
+    echo "→ Sistema con dracut: se continúa con instalar-dracut"
+    # (4.17.1) Primero la fase tardía (guardian-late) en chroot, sin tocar el initramfs;
+    # luego, igual que antes, instalar-dracut pone la fase early.
+    install -d -m 0700 -o root -g root "$MNT/root/guardian-src" || die "No se pudo copiar Guardian dentro"
+    for f in guardian guardian-early install-guardian; do
+        install -m 0755 -o root -g root "$SRC/$f" "$MNT/root/guardian-src/$f" || die "No se pudo copiar $f dentro"
+    done
+    if [[ -f "$SRC/guardian-actualizar" ]]; then   # 4.19.1: install-guardian lo instala si está
+        install -m 0755 -o root -g root "$SRC/guardian-actualizar" "$MNT/root/guardian-src/guardian-actualizar" || die "No se pudo copiar guardian-actualizar dentro"
+    fi
+    mount --bind /dev "$MNT/dev" && mount --bind /dev/pts "$MNT/dev/pts" \
+      && mount -t proc proc "$MNT/proc" && mount -t sysfs sys "$MNT/sys" || die "No se pudieron preparar los montajes del chroot"
+    echo "→ Fase tardía dentro de ese sistema..."
+    chroot "$MNT" /usr/bin/env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+        HOME=/root TERM="${TERM:-dumb}" GUARDIAN_CHROOT=1 GUARDIAN_SOLO_TARDIA=1 \
+        /bin/bash /root/guardian-src/install-guardian </dev/null \
+        || die "La fase tardía falló dentro de ese sistema (la fase early no se tocó)"
+    rm -rf "$MNT/root/guardian-src"
+    echo "  ✔ Fase tardía instalada; ahora la fase early con instalar-dracut"
+    cleanup; trap - EXIT
+    exec /bin/bash "$SRC/instalar-dracut" "$DEV" --sistema-confiable --early "$SRC/guardian-early"
+else die "Ese sistema no usa initramfs-tools (Debian/Ubuntu), mkinitcpio (Arch), dracut (Fedora/openSUSE) ni mkinitfs (Alpine): no soportado"; fi
+
+ARCH_IMGS=()
+if [[ "$TIPO" == debian ]]; then
+    [[ -x "$MNT/usr/sbin/update-initramfs" ]] || die "Falta update-initramfs en ese sistema"
+    # Kernel que ese sistema arranca por defecto (el más reciente instalado)
+    link=$(readlink "$MNT/vmlinuz" 2>/dev/null || readlink "$MNT/boot/vmlinuz" 2>/dev/null || true)
+    KVER="${link##*vmlinuz-}"
+    if [[ -z "$KVER" || ! -d "$MNT/lib/modules/$KVER" ]]; then
+        KVER=$(ls -1 "$MNT/lib/modules" 2>/dev/null | sort -V | tail -n1)
+    fi
+    [[ -n "$KVER" && -d "$MNT/lib/modules/$KVER" ]] || die "No encontré el kernel de ese sistema"
+    IMG="$MNT/boot/initrd.img-$KVER"
+    [[ -f "$IMG" ]] || die "No existe $IMG"
+    echo "→ Kernel objetivo: $KVER  (los demás kernels quedan intactos como respaldo)"
+
+    # Respaldo del initrd (fuera de /boot para que GRUB no lo confunda)
+    mkdir -p "$BK"
+    BKFILE="$BK/initrd.img-$KVER.$(date +%Y%m%d_%H%M%S)"
+    cp -a "$IMG" "$BKFILE" || die "No se pudo respaldar el initrd"
+    RESTORE="$BKFILE"
+    echo "→ Respaldo del initrd: $BKFILE"
+else
+    KVER="arch"
+    ls "$MNT"/etc/mkinitcpio.d/*.preset >/dev/null 2>&1 || die "Ese Arch no tiene presets en /etc/mkinitcpio.d"
+    ls "$MNT"/boot/vmlinuz-* >/dev/null 2>&1 || die "No hay kernel en el /boot de $DEV: su /boot está en otra partición (todavía no soportado)"
+    for f in "$MNT"/boot/initramfs-*.img; do [[ -f "$f" ]] && ARCH_IMGS+=("$f"); done
+    (( ${#ARCH_IMGS[@]} > 0 )) || die "No hay imágenes /boot/initramfs-*.img en $DEV (¿UKI o /boot en otra partición?): todavía no soportado"
+    mkdir -p "$BK"
+    BKFILE=$(mktemp -d "$BK/arch-$(date +%Y%m%d_%H%M%S).XXXXXX") || die "No se pudo crear el directorio de respaldo"
+    for f in "${ARCH_IMGS[@]}"; do cp -a "$f" "$BKFILE/" || die "No se pudo respaldar $f"; done
+    RESTORE="$BKFILE"
+    echo "→ Arch (mkinitcpio). Respaldo de ${#ARCH_IMGS[@]} imagen(es) initramfs: $BKFILE"
+fi
+
+# Copiar Guardian dentro (root:root)
+install -d -m 0700 -o root -g root "$MNT/root/guardian-src"
+for f in guardian guardian-early install-guardian; do
+    install -m 0755 -o root -g root "$SRC/$f" "$MNT/root/guardian-src/$f"
+done
+if [[ -f "$SRC/guardian-actualizar" ]]; then   # 4.19.1: install-guardian lo instala si está
+    install -m 0755 -o root -g root "$SRC/guardian-actualizar" "$MNT/root/guardian-src/guardian-actualizar"
+fi
+
+mount --bind /dev "$MNT/dev" && mount --bind /dev/pts "$MNT/dev/pts" \
+  && mount -t proc proc "$MNT/proc" && mount -t sysfs sys "$MNT/sys" || die "No se pudieron preparar los montajes del chroot"
+if [[ "$TIPO" == arch ]]; then
+    # como arch-chroot: /run propio en memoria (no se escribe en el /run del disco)
+    mount -t tmpfs -o mode=0755,nosuid,nodev run "$MNT/run" || die "No se pudo preparar /run del chroot"
+fi
+
+echo "→ Ejecutando el instalador dentro de ese sistema..."
+chroot "$MNT" /usr/bin/env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+    HOME=/root TERM="${TERM:-dumb}" GUARDIAN_KVER="$KVER" GUARDIAN_CHROOT=1 \
+    /bin/bash /root/guardian-src/install-guardian
+rc=$?
+
+restore() {
+    if [[ "$TIPO" == arch ]]; then
+        echo "⚠ Restaurando las imágenes initramfs originales..."
+        local f
+        for f in "${ARCH_IMGS[@]}"; do
+            cp -a "$RESTORE/${f##*/}" "$f" && echo "  ✔ restaurada ${f##*/}" || echo "  ✖ NO se pudo restaurar; copia a mano: $RESTORE/${f##*/} → $f"
+        done
+        echo "  ℹ Si en ese disco quedó /etc/mkinitcpio.conf.d/guardian.conf, el gancho sigue en HOOKS (el instalador de dentro repone el anterior cuando falla)."
+        return 0
+    fi
+    echo "⚠ Restaurando el initrd original..."
+    cp -a "$RESTORE" "$IMG" && echo "  ✔ initrd original restaurado" || echo "  ✖ NO se pudo restaurar; copia a mano: $RESTORE → $IMG"
+}
+
+if (( rc != 0 )); then
+    echo "✖ El instalador falló (rc=$rc)."
+    restore; exit 1
+fi
+
+if [[ "$TIPO" == arch ]]; then
+    # Verificación crítica (el instalador ya revisó cada imagen por dentro; aquí, desde fuera)
+    for f in "${ARCH_IMGS[@]}"; do
+        sz=$(stat -c %s "$f" 2>/dev/null || echo 0)
+        if (( sz < 1000000 )); then echo "✖ ${f##*/} es sospechosamente pequeña ($sz bytes)"; restore; exit 1; fi
+        list=$(chroot "$MNT" /usr/bin/lsinitcpio "/boot/${f##*/}" 2>/dev/null || true)
+        if grep -q 'usr/bin/guardian-early' <<<"$list"; then echo "  ✔ ${f##*/} ($sz bytes) contiene guardian-early"
+        else echo "✖ ${f##*/} NO contiene guardian-early"; restore; exit 1; fi
+    done
+    echo ""
+    echo "✅ Guardian instalado en $DEV (Arch, mkinitcpio)"
+    echo "   Respaldo de las imágenes originales: $BKFILE"
+    echo "   NO se tocó GRUB. Antes de reiniciar asegúrate de poder volver al otro sistema."
+    exit 0
+fi
+
+# Verificación crítica: la imagen nueva debe existir, ser razonable y poderse listar
+sz=$(stat -c %s "$IMG" 2>/dev/null || echo 0)
+if (( sz < 1000000 )); then echo "✖ El initrd nuevo es sospechosamente pequeño ($sz bytes)"; restore; exit 1; fi
+if command -v lsinitramfs >/dev/null; then
+    list=$(lsinitramfs "$IMG" 2>/dev/null || true)
+    [[ -n "$list" ]] || { echo "✖ No se puede leer el initrd nuevo"; restore; exit 1; }
+    for pat in 'bin/guardian-early' 'bin/e2fsck' 'bin/blkid' 'bin/e2image' 'bin/guardian-df' 'local-premount/guardian'; do
+        if grep -q "$pat" <<<"$list"; then echo "  ✔ initrd contiene $pat"; else echo "  ⚠ initrd NO contiene $pat"; fi
+    done
+fi
+
+echo ""
+echo "✅ Guardian instalado en $DEV (kernel $KVER)"
+echo "   Respaldo del initrd original: $BKFILE"
+echo "   NO se tocó GRUB. Antes de reiniciar asegúrate de poder volver al otro sistema."

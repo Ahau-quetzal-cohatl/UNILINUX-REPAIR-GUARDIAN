@@ -1,0 +1,591 @@
+#!/bin/bash
+# instalar-dracut v1.11 — Guardian 4.12: módulo dracut "70guardian" (Fedora / openSUSE, initramfs con systemd)
+# Uso (otro sistema, desde este):  sudo bash instalar-dracut /dev/sdXN --sistema-confiable [--kernel X] [--early ruta]
+# Uso (el sistema en marcha):      sudo bash instalar-dracut [--kernel X] [--early ruta]
+# AVISO: con DEV, el chroot EJECUTA programas de ese sistema como root: exige --sistema-confiable.
+# Hace: copia guardian-early y early.conf, instala el módulo dracut, respalda el initramfs, corre
+# `dracut -f` SOLO para un kernel, verifica la imagen con lsinitrd y, si algo falla, restaura el
+# initramfs y desactiva el módulo. NO toca el cargador (GRUB), ni fstab, ni datos.
+# Límite: solo initramfs con systemd. Sin fase tardía (usa dpkg/pacman; Fedora usa rpm).
+set -uo pipefail
+VERSION="1.11"
+GE=/usr/lib/guardian/guardian-early        # 1.5: ruta dentro de /usr (va en el snapshot)
+GE_VIEJO=/usr/local/sbin/guardian-early   # ruta de 1.4 y anteriores (otro subvolumen en openSUSE)
+SRC="$(cd "$(dirname "$0")" && pwd)"
+R="${GUARDIAN_ROOT:-}"          # prefijo: solo para pruebas (en uso real está vacío)
+DEV=""; TRUST=0; EARLY=""; KVER="${GUARDIAN_KVER:-}"; INNER=0
+MNT=/mnt/guardian-target
+BKHOST=/var/backups/guardian-initrd
+
+die() { echo "✖ $*"; exit 1; }
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --sistema-confiable) TRUST=1 ;;
+        --interno)           INNER=1 ;;
+        --early)             shift; EARLY="${1:-}" ;;
+        --kernel)            shift; KVER="${1:-}" ;;
+        /dev/*)              DEV="$1" ;;
+        *)                   die "Opción desconocida: $1" ;;
+    esac
+    shift
+done
+
+# guardian-early: --early, o el de esta carpeta, o el ya instalado
+buscar_early() {
+    local c
+    for c in "$EARLY" "$SRC/guardian-early" "$R$GE" "$R$GE_VIEJO"; do
+        [[ -n "$c" && -f "$c" ]] && { echo "$c"; return 0; }
+    done
+    return 1
+}
+
+CONF_DEFECTO='# Guardian early (initramfs). Se copia al initramfs con dracut.
+# ON_FAIL = qué hacer si la raíz tiene un daño que e2fsck -p no puede reparar:
+#   nada | solo_con_respaldo | respaldo_y_forzar | forzar
+# BACKUP_MIN_MB  = espacio libre mínimo (MB) de la partición de respaldo.
+# META_MIN_MB    = espacio libre mínimo (MB) para la imagen de METADATOS (e2image -r).
+# BACKUP_UUID    = (opcional) UUID de la ÚNICA partición donde guardar el respaldo; vacío = la primera con espacio.
+# BACKUP_EXCLUDE = (opcional) UUIDs separados por espacio de particiones que NUNCA se usan (p. ej. un disco que falla).
+# IMPORTANTE: tras editar este archivo ejecuta: sudo dracut -f
+ON_FAIL=respaldo_y_forzar
+BACKUP_MIN_MB=512
+META_MIN_MB=2048
+BACKUP_UUID=
+BACKUP_EXCLUDE='
+
+# ══════════════════════ PARTE INTERNA (dentro del sistema destino) ══════════════════════
+escribir_modulo() {
+    local d="$R/usr/lib/dracut/modules.d/70guardian"
+    install -d -m 0755 "$d" || return 1
+    cat > "$d/module-setup.sh" << 'MODULO'
+#!/bin/bash
+# Guardian early: revisa la raiz ext4 antes de montarla (initramfs dracut con systemd)
+check() {
+    [[ -x /usr/lib/guardian/guardian-early || -x /usr/local/sbin/guardian-early ]] || return 255
+    require_binaries e2fsck blkid e2image || return 1
+    return 0
+}
+depends() { return 0; }
+installkernel() {
+    hostonly='' instmods ext4 vfat nls_cp437 nls_iso8859_1 nls_ascii nls_utf8
+    hostonly='' instmods btrfs xfs 2>/dev/null || :
+}
+install() {
+    local u=${systemdsystemunitdir:-/usr/lib/systemd/system} p
+    inst_multiple e2fsck blkid e2image
+    inst_multiple -o btrfs btrfs-image xfs_repair xfs_db
+    inst_multiple -o cat mkdir rmdir readlink mount umount sleep sync date dd
+    local ge=/usr/lib/guardian/guardian-early
+    [[ -x $ge ]] || ge=/usr/local/sbin/guardian-early
+    inst_simple "$ge" /usr/bin/guardian-early
+    chmod 755 "${initdir}/usr/bin/guardian-early"
+    p=$(type -P df) && case "$(basename "$(readlink -f "$p")")" in
+        df|gnudf) inst "$p" /usr/bin/guardian-df ;;
+        *) inst_multiple df   # (4.18.4) df multillamada (uutils/busybox): responde a su nombre
+           mkdir -p "${initdir}/usr/bin"
+           printf '#!/bin/sh\nexec df "$@"\n' >"${initdir}/usr/bin/guardian-df"
+           chmod 755 "${initdir}/usr/bin/guardian-df" ;;
+    esac
+    [[ -f /etc/guardian/early.conf ]] \
+        && inst_simple /etc/guardian/early.conf /etc/guardian-early.conf
+    inst_simple "$moddir/guardian-early.service" "$u/guardian-early.service"
+    mkdir -p "${initdir}${u}/initrd-root-fs.target.wants"
+    ln_r "$u/guardian-early.service" \
+         "$u/initrd-root-fs.target.wants/guardian-early.service"
+}
+MODULO
+    cat > "$d/guardian-early.service" << 'UNIDAD'
+[Unit]
+Description=Guardian early: revisa la raiz antes de montarla
+DefaultDependencies=no
+ConditionPathExists=/etc/initrd-release
+After=initrd-root-device.target systemd-hibernate-resume.service
+Before=systemd-fsck-root.service sysroot.mount initrd-root-fs.target shutdown.target
+Conflicts=shutdown.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/guardian-early
+StandardOutput=journal+console
+StandardError=journal+console
+TimeoutStartSec=0
+UNIDAD
+    chmod 0755 "$d/module-setup.sh"; chmod 0644 "$d/guardian-early.service"
+}
+
+# Piezas que debe contener el initramfs (patrón ERE sobre la salida de lsinitrd)
+PIEZAS=(
+ 'usr/bin/guardian-early( -> .*)?$|usr/bin/guardian-early'
+ 'bin/e2fsck( -> .*)?$|e2fsck'
+ 'bin/blkid( -> .*)?$|blkid'
+ 'bin/e2image( -> .*)?$|e2image'
+ 'usr/bin/guardian-df( -> .*)?$|guardian-df'
+ 'system/guardian-early\.service( -> .*)?$|unidad guardian-early.service'
+ 'initrd-root-fs\.target\.wants/guardian-early\.service( -> .*)?$|enlace en initrd-root-fs.target.wants'
+ 'etc/guardian-early\.conf( -> .*)?$|etc/guardian-early.conf'
+ 'bin/mount( -> .*)?$|mount'
+ 'bin/umount( -> .*)?$|umount'
+ 'bin/sync( -> .*)?$|sync'
+)
+
+verificar_imagen() {   # $1 = imagen; imprime una línea por pieza; devuelve nº de faltantes
+    local img="$1" list p pat nom falta=0 a b
+    list=$(lsinitrd "$img" 2>/dev/null) || list=""
+    [[ -n "$list" ]] || { echo "  ✖ no se puede leer la imagen con lsinitrd"; return 99; }
+    for p in "${PIEZAS[@]}"; do
+        pat="${p%%|*}"; nom="${p#*|}"
+        if grep -Eq "$pat" <<<"$list"; then echo "  ✔ initramfs contiene $nom"
+        else echo "  ✖ initramfs NO contiene $nom"; falta=$((falta + 1)); fi
+    done
+    # btrfs/xfs (v1.4): si el sistema tiene la herramienta, debe estar dentro de la imagen
+    for p in 'bin/btrfs($| )@btrfs' 'bin/xfs_repair($| )@xfs_repair' 'bin/xfs_db($| )@xfs_db'; do
+        pat="${p%%@*}"; nom="${p#*@}"
+        [[ -x "$R/usr/bin/$nom" || -x "$R/usr/sbin/$nom" || -x "$R/bin/$nom" || -x "$R/sbin/$nom" ]] || continue
+        if grep -Eq "$pat" <<<"$list"; then echo "  ✔ initramfs contiene $nom"
+        else echo "  ✖ initramfs NO contiene $nom"; falta=$((falta + 1)); fi
+    done
+    # Los archivos de dentro deben ser EXACTAMENTE los instalados
+    a=$(lsinitrd "$img" usr/bin/guardian-early 2>/dev/null | sha256sum | cut -d' ' -f1)
+    b=$(sha256sum < "$R$GE" | cut -d' ' -f1)
+    if [[ "$a" == "$b" ]]; then echo "  ✔ guardian-early de dentro = el instalado"
+    else echo "  ✖ guardian-early de dentro NO coincide con el instalado"; falta=$((falta + 1)); fi
+    if [[ -f "$R/etc/guardian/early.conf" ]]; then
+        a=$(lsinitrd "$img" etc/guardian-early.conf 2>/dev/null | sha256sum | cut -d' ' -f1)
+        b=$(sha256sum < "$R/etc/guardian/early.conf" | cut -d' ' -f1)
+        if [[ "$a" == "$b" ]]; then echo "  ✔ early.conf de dentro = el instalado"
+        else echo "  ✖ early.conf de dentro NO coincide con el instalado"; falta=$((falta + 1)); fi
+    fi
+    return "$falta"
+}
+
+# >>> esp_imagen (4.17.8)
+# systemd-boot tipo 1: el initrd que se arranca está en la ESP (lo escribe kernel-install), no en
+# /boot/initramfs-K.img. Imprime la ruta del initrd de la ESP para $KVER, o nada si no hay
+# systemd-boot. Devuelve 1 (sin tocar nada, aviso en stderr) si es UKI, si hay más de un initrd,
+# o si hay señales de systemd-boot pero no veo su initrd: layout=bls|uki en /etc/kernel/install.conf
+# o /etc/kernel/entry-token (aunque haya entradas de GRUB), o layout de /usr/lib sin entradas de GRUB.
+esp_imagen() {
+    local lay="" f d e ini p q senal="" fuerte=0 grubbls=0 lista=() uki=() vistos=" "
+    for f in "$R/etc/kernel/install.conf" "$R/usr/lib/kernel/install.conf"; do
+        [[ -f "$f" ]] || continue
+        lay=$(sed -n 's/^[[:space:]]*layout=\([a-z0-9-]*\).*/\1/p' "$f" | tail -n 1)
+        if [[ -n "$lay" ]]; then
+            [[ "$lay" == bls || "$lay" == uki ]] && { senal="layout=$lay"; [[ "$f" == "$R/etc/"* ]] && fuerte=1; }
+            break
+        fi
+    done
+    [[ -s "$R/etc/kernel/entry-token" ]] && { senal="${senal:-entry-token}"; fuerte=1; }
+    for d in "$R/efi" "$R/boot/efi" "$R/boot"; do
+        [[ -d "$d" ]] || continue
+        q=$(readlink -f "$d"); [[ "$vistos" == *" $q "* ]] && continue; vistos+="$q "
+        for e in "$d"/loader/entries/*"$KVER"*.conf; do
+            [[ -f "$e" ]] || continue
+            while read -r ini; do
+                [[ -n "$ini" ]] || continue
+                p="$d/${ini#/}"
+                if [[ -n "$IMG" ]] && { [[ "$p" -ef "$IMG" ]] || [[ "$R/${ini#/}" -ef "$IMG" ]]; }; then
+                    grubbls=1; continue
+                fi
+                # ruta relativa a la ESP montada, o absoluta (BOOT_ROOT que no es punto de montaje)
+                [[ -f "$p" ]] || { p="$R/${ini#/}"; [[ -f "$p" && "$p" == "$d/"* ]] || continue; }
+                q=$(readlink -f "$p"); [[ " ${lista[*]} " == *" $q "* ]] || lista+=("$q")
+            done < <(sed -n 's/^initrd[[:space:]]\{1,\}\([^[:space:]]*\).*/\1/p' "$e")
+        done
+        for e in "$d"/EFI/Linux/*"$KVER"*.efi; do [[ -f "$e" ]] && uki+=("${e#"$R"}"); done
+    done
+    if (( ${#uki[@]} > 0 )); then
+        if (( ${#uki[@]} > 1 || ${#lista[@]} > 0 )); then
+            echo "✖ Hay ${#uki[@]} UKI y ${#lista[@]} initrd de $KVER en la ESP; no sé cuál arranca. No se tocó nada." >&2
+            return 1
+        fi
+        echo "UKI:$R${uki[0]}"
+        return 0
+    fi
+    if (( ${#lista[@]} > 1 )); then
+        echo "✖ Hay ${#lista[@]} initrd distintos de $KVER en la ESP; no sé cuál arranca. No se tocó nada." >&2
+        return 1
+    fi
+    if (( ${#lista[@]} == 1 )); then echo "${lista[0]}"; return 0; fi
+    if [[ -n "$senal" ]] && (( grubbls == 0 || fuerte == 1 )); then
+        echo "✖ Hay señales de systemd-boot ($senal) pero no veo el initrd de $KVER en /efi, /boot/efi ni /boot (¿ESP sin montar?). No se tocó nada." >&2
+        return 1
+    fi
+    return 0
+}
+# <<< esp_imagen
+
+# >>> uki (4.17.9)
+# UKI (systemd-boot tipo 2): el initramfs va DENTRO del .efi (sección .initrd). Se rehace con
+# kernel-install add (lo mismo que una actualización del kernel) y se lee con uki_extraer.
+uki_extraer() {   # $1 = .efi  $2 = destino: copia exacta de la sección .initrd (sin relleno)
+    command -v python3 >/dev/null 2>&1 || return 1
+    python3 -c '
+import struct, sys
+d = open(sys.argv[1], "rb").read()
+if d[:2] != b"MZ": sys.exit(2)
+pe = struct.unpack_from("<I", d, 0x3c)[0]
+if d[pe:pe+4] != b"PE\0\0": sys.exit(2)
+ns = struct.unpack_from("<H", d, pe+6)[0]; so = struct.unpack_from("<H", d, pe+20)[0]
+for i in range(ns):
+    o = pe + 24 + so + 40*i
+    vs, va, rs, rp = struct.unpack_from("<IIII", d, o+8)
+    if d[o:o+8].rstrip(b"\0") == b".initrd" and rp + min(vs, rs) <= len(d):
+        open(sys.argv[2], "wb").write(d[rp:rp+min(vs, rs)]); sys.exit(0)
+sys.exit(3)' "$1" "$2" 2>/dev/null && [[ -s "$2" ]]
+}
+# Comprueba que kernel-install sabe rehacer el UKI ($UKI) y prepara VIMG (su .initrd), VMLZ y UKI_SHA0.
+# Devuelve 1 con aviso en stderr y SIN tocar nada si falta algo.
+uki_preparar() {
+    local f fs=() lay="" gen="" c
+    local no="No se tocó nada."
+    command -v kernel-install >/dev/null 2>&1 || { echo "✖ Hay UKI (${UKI#"$R"}) pero no kernel-install: no sé rehacerlo. $no" >&2; return 1; }
+    command -v python3 >/dev/null 2>&1 || { echo "✖ UKI: falta python3 para leer el .initrd del .efi. $no" >&2; return 1; }
+    for f in "$R/etc/kernel/install.conf" "$R/usr/lib/kernel/install.conf"; do [[ -f "$f" ]] && { fs+=("$f"); break; }; done
+    for f in "$R"/usr/lib/kernel/install.conf.d/*.conf "$R"/etc/kernel/install.conf.d/*.conf; do [[ -f "$f" ]] && fs+=("$f"); done
+    if (( ${#fs[@]} > 0 )); then
+        lay=$(cat "${fs[@]}" | sed -n 's/^[[:space:]]*layout=\([a-z0-9-]*\).*/\1/p' | tail -n 1)
+        gen=$(cat "${fs[@]}" | sed -n 's/^[[:space:]]*uki_generator=\([a-z0-9-]*\).*/\1/p' | tail -n 1)
+    fi
+    [[ "$lay" == uki ]] || { echo "✖ Hay UKI (${UKI#"$R"}) pero kernel-install no está en layout=uki (lo hizo otra herramienta): no sé rehacerlo. $no" >&2; return 1; }
+    ls "$R"/usr/lib/systemd/boot/efi/linux*.efi.stub >/dev/null 2>&1 || { echo "✖ UKI: falta el stub de systemd (linux*.efi.stub; paquete systemd-boot-unsigned / systemd-boot-efi). $no" >&2; return 1; }
+    if [[ "$gen" == ukify ]]; then
+        command -v ukify >/dev/null 2>&1 || [[ -x "$R/usr/lib/systemd/ukify" ]] || { echo "✖ UKI con uki_generator=ukify pero falta ukify (systemd-ukify). $no" >&2; return 1; }
+    else
+        command -v objcopy >/dev/null 2>&1 || { echo "✖ UKI con dracut --uefi pero falta objcopy (binutils). $no" >&2; return 1; }
+    fi
+    VMLZ=""
+    for c in "/usr/lib/modules/$KVER/vmlinuz" "/lib/modules/$KVER/vmlinuz" "/boot/vmlinuz-$KVER"; do [[ -f "$R$c" ]] && { VMLZ=$c; break; }; done
+    [[ -n "$VMLZ" ]] || { echo "✖ UKI: no encuentro el vmlinuz de $KVER. $no" >&2; return 1; }
+    VIMG=$(mktemp "${TMPDIR:-/tmp}/guardian-uki.XXXXXX") || { echo "✖ UKI: mktemp. $no" >&2; return 1; }
+    uki_extraer "$UKI" "$VIMG" || { rm -f "$VIMG"; VIMG=""; echo "✖ UKI: no pude leer la sección .initrd de ${UKI#"$R"}. $no" >&2; return 1; }
+    UKI_SHA0=$(sha256sum "$UKI" | cut -d' ' -f1)
+    return 0
+}
+# <<< uki
+
+interno() {
+    [[ $(id -u) -eq 0 || -n "$R" ]] || die "Usa: sudo bash $0"
+    command -v dracut   >/dev/null 2>&1 || die "Este sistema no tiene dracut (¿Debian/Ubuntu? usa install-guardian; ¿Arch? usa mkinitcpio)"
+    command -v lsinitrd >/dev/null 2>&1 || die "Falta lsinitrd (viene con dracut)"
+    local EARLYF; EARLYF=$(buscar_early) || die "No encuentro guardian-early (usa --early ruta)"
+    [[ -n "$KVER" ]] || KVER=$(uname -r)
+    [[ -d "$R/lib/modules/$KVER" || -d "$R/usr/lib/modules/$KVER" ]] || die "No existe el kernel $KVER en este sistema"
+
+    local IMG="" c
+    for c in "$R/boot/initramfs-$KVER.img" "$R/boot/initrd-$KVER" "$R/boot/initrd.img-$KVER"; do [[ -f "$c" ]] && { IMG="$c"; break; }; done
+    # (4.17.8) systemd-boot tipo 1: el initrd que arranca está en la ESP, no en /boot
+    local EI; EI=$(esp_imagen) || die "No se tocó nada (ver el aviso de arriba)"
+    # (4.17.9) UKI: el initramfs va dentro del .efi; se rehace con kernel-install add
+    local UKI="" VIMG="" VMLZ="" UKI_SHA0=""
+    if [[ "$EI" == UKI:* ]]; then
+        UKI="${EI#UKI:}"; EI=""
+        uki_preparar || die "No se tocó nada (ver el aviso de arriba)"
+        [[ -n "$IMG" ]] && echo "  (también hay ${IMG#"$R"}: con UKI no se arranca y no se toca)"
+        IMG="$UKI"; echo "→ UKI: el initramfs va dentro de ${IMG#"$R"}; se rehace con kernel-install"
+    fi
+    if [[ -n "$EI" ]]; then
+        [[ -n "$IMG" ]] && echo "  (también hay ${IMG#"$R"}: con systemd-boot no se arranca y no se toca)"
+        IMG="$EI"; echo "→ systemd-boot: el initrd que se arranca es ${IMG#"$R"} (ESP)"
+    fi
+    [[ -n "$IMG" ]] || die "No encuentro el initramfs de $KVER en /boot (¿/boot en otra partición sin montar?)"
+    echo "→ Kernel objetivo: $KVER   imagen: ${IMG#"$R"}"
+
+    # Solo initramfs con systemd: la unidad cuelga de initrd-root-fs.target
+    # (a una variable: con pipefail, `lsinitrd | grep -q` falla por SIGPIPE en una imagen grande)
+    local lst0; lst0=$(lsinitrd "${VIMG:-$IMG}" 2>/dev/null) || lst0=""
+    if ! grep -q 'initrd-root-fs\.target' <<<"$lst0"; then
+        die "El initramfs actual no es de systemd: este módulo no lo soporta (no se tocó nada)"
+    fi
+
+    local MIN="${GUARDIAN_MIN_IMG:-1000000}"
+    local BK="$R/var/backups/guardian-initrd" BKF
+    install -d -m 0700 "$BK" || die "No pude crear $BK"
+    BKF="$BK/$(basename "$IMG").$(date +%Y%m%d_%H%M%S)"
+    cp -a "$IMG" "$BKF" || die "No se pudo respaldar el initramfs"
+    echo "→ Respaldo del initramfs: ${BKF#"$R"}"
+
+    restaurar() {
+        echo "⚠ Restaurando el initramfs original y desactivando el módulo..."
+        cp -a "$BKF" "$IMG" && echo "  ✔ initramfs original restaurado" || echo "  ✖ NO se pudo restaurar; copia a mano: ${BKF#"$R"} → ${IMG#"$R"}"
+        rm -f "$R/etc/dracut.conf.d/20-guardian.conf"
+    }
+
+    # Archivos
+    install -d -m 0755 "$R${GE%/*}" "$R/etc/guardian" "$R/etc/dracut.conf.d" || die "No pude crear directorios"
+    local dst="$R$GE"
+    if [[ "$(readlink -f "$EARLYF")" != "$(readlink -f "$dst" 2>/dev/null || echo x)" ]]; then
+        install -o root -g root -m 755 "$EARLYF" "$dst" 2>/dev/null || install -m 755 "$EARLYF" "$dst" || die "No pude instalar guardian-early"
+    fi
+    echo "  ✔ $GE"
+    if [[ ! -f "$R/etc/guardian/early.conf" ]]; then
+        printf '%s\n' "$CONF_DEFECTO" > "$R/etc/guardian/early.conf" && chmod 644 "$R/etc/guardian/early.conf"
+        echo "  ✔ /etc/guardian/early.conf (nuevo, con valores por defecto)"
+    else
+        echo "  ✔ /etc/guardian/early.conf ya existía: no se toca"
+    fi
+    escribir_modulo || { restaurar; die "No pude escribir el módulo dracut"; }
+    printf '# Guardian early (instalar-dracut v%s)\nadd_dracutmodules+=" guardian "\n' "$VERSION" > "$R/etc/dracut.conf.d/20-guardian.conf"
+    echo "  ✔ módulo 70guardian y /etc/dracut.conf.d/20-guardian.conf"
+
+    echo "→ Regenerando el initramfs (solo kernel $KVER)..."
+    # 1.5: si el destino no tiene /var/tmp (p. ej. /var es otro subvolumen sin montar),
+    # dracut recibe un tmpdir propio que se borra al terminar
+    local GTMP="" drc=0
+    if [[ ! -d "$R/var/tmp" || ! -w "$R/var/tmp" ]]; then
+        GTMP=$(mktemp -d "${TMPDIR:-/tmp}/guardian-dracut.XXXXXX" 2>/dev/null) \
+            || GTMP=$(mktemp -d "$R/root/guardian-dracut.XXXXXX" 2>/dev/null) || GTMP=""
+        [[ -n "$GTMP" ]] && echo "  (sin /var/tmp: dracut usa ${GTMP#"$R"})"
+    fi
+    if [[ -n "$UKI" ]]; then
+        kernel-install add "$KVER" "$VMLZ" </dev/null || drc=$?
+    else
+        dracut -f ${GTMP:+--tmpdir "$GTMP"} --kver "$KVER" "${IMG#"$R"}" </dev/null || drc=$?
+    fi
+    [[ -n "$GTMP" ]] && rm -rf -- "$GTMP"
+    if (( drc != 0 )); then
+        echo "✖ dracut falló"; restaurar; exit 1
+    fi
+    if [[ -n "$UKI" ]]; then
+        if [[ ! -f "$IMG" || "$(sha256sum "$IMG" | cut -d' ' -f1)" == "$UKI_SHA0" ]]; then
+            echo "✖ kernel-install no rehízo ${IMG#"$R"} (¿otro BOOT_ROOT o nombre?)"; restaurar; exit 1
+        fi
+        uki_extraer "$IMG" "$VIMG" || { echo "✖ No pude leer el .initrd del UKI nuevo"; restaurar; exit 1; }
+    fi
+    local sz; sz=$(stat -c %s "$IMG" 2>/dev/null || echo 0)
+    if (( sz < MIN )); then echo "✖ El initramfs nuevo es sospechosamente pequeño ($sz bytes)"; restaurar; exit 1; fi
+    echo "  ✔ initramfs regenerado ($((sz / 1024)) KB)"
+
+    local out rc
+    out=$(verificar_imagen "${VIMG:-$IMG}"); rc=$?
+    echo "$out"
+    if (( rc != 0 )); then echo "✖ La imagen nueva no trae todas las piezas ($rc faltan)"; restaurar; exit 1; fi
+    [[ -n "$VIMG" ]] && rm -f "$VIMG"
+
+    echo ""
+    echo "✅ Guardian early (dracut) instalado para el kernel $KVER"
+    [[ -n "$EI" ]] && echo "   systemd-boot: los kernels nuevos los genera kernel-install (ya con Guardian). A mano: sudo kernel-install add $KVER /usr/lib/modules/$KVER/vmlinuz"
+    [[ -n "$UKI" ]] && echo "   UKI: los kernels nuevos los genera kernel-install (ya con Guardian). A mano (p. ej. tras cambiar early.conf): sudo kernel-install add $KVER $VMLZ"
+    echo "   Respaldo del initramfs original: ${BKF#"$R"}"
+    echo "   Saltar: guardian.skip en la línea de kernel. Resultado tras reiniciar: cat /run/guardian/early_status ; journalctl -u guardian-early"
+    echo "   Si cambias /etc/guardian/early.conf: sudo dracut -f   (otros kernels: sudo dracut -f --kver X)"
+}
+
+if (( INNER == 1 )) || [[ -z "$DEV" ]]; then
+    interno
+    exit $?
+fi
+
+# ══════════════════════ PARTE EXTERNA (otro disco, con chroot) ══════════════════════
+die() { echo "✖ $*"; exit 1; }
+[[ $(id -u) -eq 0 ]] || die "Usa: sudo bash $0 /dev/sdXN --sistema-confiable"
+[[ -b "$DEV" ]] || die "El dispositivo $DEV no existe"
+if (( TRUST != 1 )); then
+    echo "⛔ Este script entra a $DEV con chroot y EJECUTA programas de ese sistema como root,"
+    echo "   con acceso a todos tus discos. Si ese sistema pudiera estar infectado, NO lo hagas."
+    echo "   Solo si estás seguro de que está limpio, repite añadiendo:  --sistema-confiable"
+    exit 2
+fi
+EARLYF=$(buscar_early) || die "No encuentro guardian-early (usa --early ruta)"
+
+cur=$(readlink -f "$(findmnt -n -o SOURCE /)")
+[[ "$(readlink -f "$DEV")" != "$cur" ]] || die "$DEV es el sistema que estás usando: ejecuta el script sin dispositivo."
+
+# Desmontar si el escritorio lo montó solo
+while read -r t; do
+    [[ -n "$t" ]] || continue
+    echo "→ Desmontando $t ..."
+    umount "$t" || die "No se pudo desmontar $t (cierra lo que lo use y repite)"
+done < <(findmnt -rn -S "$DEV" -o TARGET)
+
+FST=$(blkid -o value -s TYPE "$DEV" 2>/dev/null)
+case "$FST" in
+    ext2|ext3|ext4)
+        state=$(dumpe2fs -h "$DEV" 2>/dev/null </dev/null | awk -F': *' '/^Filesystem state/{print $2}')
+        [[ "$state" == clean ]] || die "$DEV no está 'clean' (estado: ${state:-?}). Ejecuta antes:  sudo e2fsck -p $DEV"
+        if dumpe2fs -h "$DEV" 2>/dev/null </dev/null | grep -q 'needs_recovery'; then
+            die "$DEV tiene el diario sin recuperar (needs_recovery). Ejecuta antes:  sudo e2fsck -p $DEV"
+        fi ;;
+    btrfs|xfs) echo "→ $DEV es '$FST': guardian-early lo comprobará con un montaje de prueba y solo repara si falla." ;;
+    *) echo "⚠ $DEV es '$FST': se instala igual, pero guardian-early omitirá la raíz (solo repara ext2/3/4, btrfs y xfs)." ;;
+esac
+
+SUBVOLS_MONTADOS=()   # (4.17.3) subvolúmenes btrfs montados por montar_subvols_fstab
+cleanup() {
+    local m
+    for m in dev/pts dev proc sys; do mountpoint -q "$MNT/$m" 2>/dev/null && umount -l "$MNT/$m" 2>/dev/null; done
+    local i   # (4.17.3) subvolúmenes del fstab, en orden inverso
+    for (( i=${#SUBVOLS_MONTADOS[@]}-1; i>=0; i-- )); do
+        umount "${SUBVOLS_MONTADOS[i]}" 2>/dev/null || umount -l "${SUBVOLS_MONTADOS[i]}" 2>/dev/null
+    done
+    if mountpoint -q "$MNT" 2>/dev/null; then umount "$MNT" 2>/dev/null || umount "$MNT" 2>/dev/null || echo "⚠ No se pudo desmontar $MNT (revisa con: findmnt $MNT)"; fi
+}
+trap cleanup EXIT
+
+mkdir -p "$MNT"
+mount "$DEV" "$MNT" || die "No se pudo montar $DEV"
+# >>> (4.17.3) btrfs: si el subvolumen por defecto no es un sistema, buscar la raíz en un
+# subvolumen (Fedora subvol=root, Ubuntu/Arch @). Vale solo si su /etc/fstab dice que "/" es
+# ESE subvolumen de este mismo disco, y si hay exactamente uno.
+raiz_subvol_btrfs() {
+    [[ -f "$MNT/etc/os-release" ]] && return 0
+    local ruuid c sv spec mp tipo opts resto o hall=()
+    ruuid=$(blkid -s UUID -o value "$DEV" 2>/dev/null </dev/null)
+    [[ -n "$ruuid" ]] || { echo "  ⚠ $DEV sin UUID: no busco la raíz en subvolúmenes"; return 0; }
+    for c in @ root @root rootfs @rootfs; do
+        [[ -d "$MNT/$c" && ! -L "$MNT/$c" && -f "$MNT/$c/etc/os-release" && -f "$MNT/$c/etc/fstab" ]] || continue
+        sv=""
+        while read -r spec mp tipo opts resto; do
+            [[ "$mp" == / && "$tipo" == btrfs ]] || continue
+            case "$spec" in "UUID=$ruuid"|"/dev/disk/by-uuid/$ruuid"|"$DEV") ;; *) continue ;; esac
+            case ",$opts," in *,subvol=*) o=",$opts"; sv=${o#*,subvol=}; sv=${sv%%,*}; sv=${sv#/} ;; esac
+        done <"$MNT/$c/etc/fstab"
+        [[ "$sv" == "$c" ]] && hall+=("$c")
+    done
+    if (( ${#hall[@]} != 1 )); then
+        echo "  ⚠ btrfs: el subvolumen por defecto no es un sistema y no hay una raíz única en subvolúmenes (${#hall[@]})"
+        return 0
+    fi
+    umount "$MNT" || die "No pude desmontar $MNT para montar la raíz ${hall[0]}"
+    mount -o "subvol=${hall[0]}" "$DEV" "$MNT" </dev/null || die "No se pudo montar el subvolumen ${hall[0]} de $DEV"
+    echo "  ✔ Raíz en el subvolumen ${hall[0]} (no es el de por defecto)"
+    return 0
+}
+# btrfs: montar también los subvolúmenes que lista el fstab del destino (/var, /usr/local,
+# /root...), como instalar-en-disco 4.17.2: el respaldo y lo que escriba el chroot quedan visibles.
+montar_subvols_fstab() {
+    local ruuid spec mp tipo opts resto o sv prof l lista=()
+    ruuid=$(blkid -s UUID -o value "$DEV" 2>/dev/null </dev/null)
+    [[ -n "$ruuid" ]] || { echo "  ⚠ $DEV sin UUID: no se montan subvolúmenes"; return 0; }
+    while read -r spec mp tipo opts resto; do
+        [[ -z "$spec" || "$spec" == \#* ]] && continue
+        [[ "$tipo" == btrfs && "$mp" == /?* ]] || continue
+        case "$spec" in
+            "UUID=$ruuid"|"/dev/disk/by-uuid/$ruuid"|"$DEV") ;;
+            *) continue ;;
+        esac
+        case ",$opts," in *,noauto,*) continue ;; esac
+        case ",$opts," in *,subvol=*) ;; *) continue ;; esac
+        o=",$opts"; sv=${o#*,subvol=}; sv=${sv%%,*}
+        [[ -n "$sv" ]] || continue
+        prof=${mp//[!\/]/}
+        lista+=("${#prof} $mp $sv")
+    done <"$MNT/etc/fstab"
+    (( ${#lista[@]} )) || return 0
+    while read -r prof mp sv; do
+        [[ -n "$mp" ]] || continue
+        if [[ -L "$MNT$mp" || ! -d "$MNT$mp" ]]; then
+            echo "  ⚠ $mp no es un directorio en el destino: no se monta"; continue
+        fi
+        mountpoint -q "$MNT$mp" 2>/dev/null && continue
+        if mount -o "subvol=$sv" "$DEV" "$MNT$mp" </dev/null; then
+            SUBVOLS_MONTADOS+=("$MNT$mp"); echo "  ✔ Subvolumen $sv montado en $mp"
+        else
+            echo "  ⚠ No se pudo montar el subvolumen $sv en $mp (sigo)"
+        fi
+    done < <(printf '%s\n' "${lista[@]}" | sort -s -n -k1,1)
+    return 0
+}
+if [[ "$FST" == btrfs ]]; then raiz_subvol_btrfs; fi
+if [[ "$FST" == btrfs && -f "$MNT/etc/fstab" ]]; then montar_subvols_fstab; fi
+# <<< (4.17.3)
+[[ -f "$MNT/etc/os-release" ]] || die "No parece un sistema Linux (falta /etc/os-release)"
+echo "→ Sistema encontrado: $(grep -m1 PRETTY_NAME "$MNT/etc/os-release")"
+[[ -x "$MNT/usr/bin/dracut" || -x "$MNT/usr/sbin/dracut" || -x "$MNT/sbin/dracut" ]] || die "Ese sistema no tiene dracut"
+# >>> (4.17.4) /boot en otra partición (Fedora, LVM/LUKS, ESP en /boot): montarla desde el
+# fstab del destino para que el initramfs nuevo (y su respaldo) quede donde arranca el equipo.
+montar_boot_fstab() {
+    local spec mp tipo opts resto d o sv pk1 pk2 st n=0 l=""
+    [[ -f "$MNT/etc/fstab" ]] || return 0
+    while read -r spec mp tipo opts resto; do
+        [[ -z "$spec" || "$spec" == \#* ]] && continue
+        [[ "$mp" == /boot ]] || continue
+        n=$((n + 1)); l="$spec $tipo $opts"
+    done <"$MNT/etc/fstab"
+    if (( n != 1 )); then
+        (( n > 1 )) && echo "  ⚠ el fstab del destino tiene $n líneas para /boot: no se monta"
+        return 0
+    fi
+    read -r spec tipo opts <<<"$l"
+    case ",$opts," in *,noauto,*) echo "  ⚠ /boot es noauto en el fstab: no se monta"; return 0 ;; esac
+    case "$tipo" in ext2|ext3|ext4|xfs|btrfs|vfat) ;; *) echo "  ⚠ /boot es '$tipo': no se monta"; return 0 ;; esac
+    case "$spec" in
+        UUID=*)     d=$(blkid -U "${spec#UUID=}" 2>/dev/null </dev/null) ;;
+        LABEL=*)    d=$(blkid -L "${spec#LABEL=}" 2>/dev/null </dev/null) ;;
+        PARTUUID=*) d=/dev/disk/by-partuuid/${spec#PARTUUID=} ;;
+        /dev/*)     d=$spec ;;
+        *)          echo "  ⚠ /boot con '$spec': no sé encontrarlo"; return 0 ;;
+    esac
+    [[ -n "$d" ]] && d=$(readlink -f "$d" 2>/dev/null)
+    if [[ -z "$d" ]] || ! test -b "$d"; then
+        echo "  ⚠ no encuentro el dispositivo de /boot ($spec): no se monta"; return 0
+    fi
+    [[ "$d" == "$(readlink -f "$DEV" 2>/dev/null)" ]] && return 0   # mismo dispositivo: subvolúmenes
+    if findmnt -rn -S "$d" -o TARGET 2>/dev/null </dev/null | grep -qxE '/|/boot|/boot/efi|/efi'; then
+        echo "  ⚠ $d está montado en ESTE equipo como raíz o /boot: no se toca"; return 0
+    fi
+    pk1=$(lsblk -lnso NAME,TYPE "$d" 2>/dev/null </dev/null | awk '$2=="disk"{print $1; exit}'); pk2=$(lsblk -lnso NAME,TYPE "$DEV" 2>/dev/null </dev/null | awk '$2=="disk"{print $1; exit}')   # (4.17.7) disco físico, también bajo LVM/LUKS
+    if [[ -n "$pk1" && -n "$pk2" && "$pk1" != "$pk2" ]]; then
+        echo "  ⚠ /boot ($d) está en otro disco que $DEV: no se monta"; return 0
+    fi
+    case "$tipo" in ext2|ext3|ext4)
+        st=$(dumpe2fs -h "$d" 2>/dev/null </dev/null | awk -F': *' '/^Filesystem state/{print $2}')
+        if [[ "$st" != clean ]] || dumpe2fs -h "$d" 2>/dev/null </dev/null | grep -q needs_recovery; then
+            echo "  ⚠ /boot ($d) no está limpio: ejecuta antes  sudo e2fsck -p $d  (no se monta)"; return 0
+        fi ;;
+    esac
+    if [[ -L "$MNT/boot" || ! -d "$MNT/boot" ]]; then
+        echo "  ⚠ /boot no es un directorio en el destino: no se monta"; return 0
+    fi
+    mountpoint -q "$MNT/boot" 2>/dev/null && return 0
+    o=""
+    case ",$opts," in *,subvol=*) o=",$opts"; sv=${o#*,subvol=}; sv=${sv%%,*}; o="subvol=$sv" ;; esac
+    if mount ${o:+-o "$o"} -t "$tipo" "$d" "$MNT/boot" </dev/null; then
+        SUBVOLS_MONTADOS+=("$MNT/boot"); echo "  ✔ /boot ($d, $tipo) montado"
+    else
+        echo "  ⚠ No se pudo montar /boot ($d) (sigo)"
+    fi
+    return 0
+}
+montar_boot_fstab
+# <<< (4.17.4)
+
+# Kernel: el pedido, o el más reciente que tenga initramfs
+if [[ -z "$KVER" ]]; then
+    for k in $(ls -1 "$MNT/lib/modules" 2>/dev/null | sort -V -r); do
+        if [[ -f "$MNT/boot/initramfs-$k.img" || -f "$MNT/boot/initrd-$k" || -f "$MNT/boot/initrd.img-$k" ]]; then KVER="$k"; break; fi
+    done
+fi
+[[ -n "$KVER" ]] || die "No encontré un kernel con initramfs en ese sistema (¿/boot en otra partición?)"
+echo "→ Kernel objetivo: $KVER  (los demás quedan intactos)"
+
+# Respaldo extra del initramfs FUERA del destino
+IMGH=""; for c in "$MNT/boot/initramfs-$KVER.img" "$MNT/boot/initrd-$KVER" "$MNT/boot/initrd.img-$KVER"; do [[ -f "$c" ]] && IMGH="$c"; done
+[[ -n "$IMGH" ]] || die "No existe el initramfs de $KVER"
+mkdir -p "$BKHOST"
+BKH="$BKHOST/$(basename "$IMGH").$(date +%Y%m%d_%H%M%S)"
+cp -a "$IMGH" "$BKH" || die "No se pudo respaldar el initramfs fuera del destino"
+echo "→ Respaldo fuera del destino: $BKH"
+
+install -d -m 0700 -o root -g root "$MNT/root/guardian-src"
+install -m 0755 -o root -g root "$EARLYF" "$MNT/root/guardian-src/guardian-early"
+install -m 0755 -o root -g root "$0" "$MNT/root/guardian-src/instalar-dracut"
+
+mount --bind /dev "$MNT/dev" && mount --bind /dev/pts "$MNT/dev/pts" \
+  && mount -t proc proc "$MNT/proc" && mount -t sysfs sys "$MNT/sys" || die "No se pudieron preparar los montajes del chroot"
+
+echo "→ Ejecutando el instalador dentro de ese sistema..."
+chroot "$MNT" /usr/bin/env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+    HOME=/root TERM="${TERM:-dumb}" \
+    /bin/bash /root/guardian-src/instalar-dracut --interno --kernel "$KVER" </dev/null
+rc=$?
+rm -rf -- "$MNT/root/guardian-src"   # (4.17.3) no dejar la copia en el disco
+if (( rc != 0 )); then
+    echo "✖ El instalador interno falló (rc=$rc); él restauró el initramfs si pudo."
+    echo "  Copia de seguridad fuera del destino: $BKH"
+    exit 1
+fi
+echo ""
+echo "✅ Listo en $DEV (kernel $KVER). NO se tocó el cargador de arranque."
+echo "   Copia del initramfs original fuera del destino: $BKH"

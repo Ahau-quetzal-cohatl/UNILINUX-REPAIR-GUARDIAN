@@ -1,0 +1,975 @@
+#!/bin/bash
+# ═══════════════════════════════════════════════════════════════
+#  UNILINUX GUARDIAN — reparador de sistemas Linux
+#  Autores: Ahau Quetzalcóatl y Claude · Licencia GPL-3.0
+#  Fase tardía (bash), corre en multi-user.target
+#  Pareja: guardian-early (initramfs, fsck de la raíz)
+#
+#  Reglas:
+#   - Nunca toca un filesystem montado.
+#   - Nunca usa e2fsck -y aquí (solo -p). La raíz la trata early.
+#   - "Éxito" = el problema detectado ya no está, no "se ejecutó algo".
+#   - Avisos (SMART, espacio, firmware, red) se informan, no crean fallo.
+#   - No reinicia: early repara ANTES de montar, así que no hace falta.
+#   - Sin `set -e`: en una herramienta de reparación un comando fallido
+#     no debe abortar el resto; los errores se manejan explícitamente.
+#   - Paquetes: dpkg (Debian/Ubuntu) o pacman (Arch). En Arch solo se
+#     diagnostica (pacman -Dk) y se quita un candado huérfano; nunca se
+#     instalan ni se borran paquetes automáticamente.
+# ═══════════════════════════════════════════════════════════════
+
+set -u -o pipefail
+umask 077
+
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/run/wrappers/bin:/run/current-system/sw/bin:/nix/var/nix/profiles/default/bin"   # (4.18.5) + NixOS
+export LC_ALL=C.UTF-8
+export LANG=C.UTF-8
+
+readonly VERSION="4.19.1"
+readonly RUN_DIR="/run/guardian"
+readonly MUSIC_FILE="/usr/local/share/guardian/tema_guardian.ogg"
+readonly LOCKFILE="/run/guardian-late.lock"
+readonly GRUB_BACKUP_DIR="/var/lib/guardian/grub-backups"
+readonly MAX_GRUB_BACKUPS=5
+
+STATE_DIR=""
+STATE_VOLATILE=false
+LOG_FILE=""
+EARLY_STATUS="none"
+PULSE_UID=""
+PULSE_USER=""
+
+R='\033[0;31m'; G='\033[0;32m'; Y='\033[1;33m'
+C='\033[0;36m'; B='\033[1;34m'; M='\033[0;35m'
+N='\033[0m'; BOLD='\033[1m'
+
+declare -A PEND=()              # problemas reparables aún sin resolver
+declare -a LISTA_REPARADOS=()
+declare -a LISTA_AVISOS=()
+declare -a FS_FALLIDOS=()
+DRY_RUN=false VERBOSE=false SKIP_FSCK=false
+NO_MUSIC=false NO_VOICE=false SAFE=false NO_PACKAGES=false
+MUSIC_PID=""
+
+log()  { [[ -n "$LOG_FILE" ]] && echo "[$(date '+%H:%M:%S')] $*" >> "$LOG_FILE" 2>/dev/null; return 0; }
+ok()   { echo -e "  ${G}✔${N}  $*"; log "OK   $*"; }
+warn() { echo -e "  ${Y}⚠${N}  $*"; log "WARN $*"; }
+err()  { echo -e "  ${R}✖${N}  $*"; log "ERR  $*"; }
+info() { echo -e "  ${C}ℹ${N}  $*"; log "INFO $*"; }
+hdr()  { echo -e "\n${B}━━━ $* ━━━${N}"; log "=== $* ==="; }
+
+require_root() {
+    if [[ $(id -u) -ne 0 ]]; then
+        echo -e "${R}Error: usa sudo guardian${N}"
+        exit 1
+    fi
+}
+
+# e2fsck: bits 4,8,16,32,128 = fallo. 0,1,2,3 = éxito.
+e2fsck_ok() { (( ($1 & 252) == 0 )); }
+
+# ─── Rutas, logs y estado ─────────────────────────────────────
+# Directorio utilizable solo si es real (no symlink), de root y sin escritura de otros
+dir_seguro() {
+    local d="$1"
+    install -d -m 0750 -o root -g root "$d" 2>/dev/null || return 1
+    [[ -d "$d" && ! -L "$d" ]] || return 1
+    [[ "$(stat -c %u "$d" 2>/dev/null)" == "0" ]] || return 1
+    chmod 0750 "$d" 2>/dev/null
+    return 0
+}
+
+init_paths() {
+    local ft
+    # Logs: solo en directorio de root (nunca en el home del usuario)
+    if dir_seguro /var/log/guardian; then
+        LOG_FILE="/var/log/guardian/guardian_$(date +%Y%m%d_%H%M%S).log"
+    else
+        install -d -m 0750 "$RUN_DIR" 2>/dev/null
+        LOG_FILE="$RUN_DIR/guardian.log"
+    fi
+    ( : > "$LOG_FILE" ) 2>/dev/null || LOG_FILE=""
+
+    # Estado persistente: /var/lib/guardian en la raíz real, nunca tmpfs/ramfs
+    dir_seguro /var/lib/guardian
+    ft=$(stat -f -c %T /var/lib/guardian 2>/dev/null || echo unknown)
+    case "$ft" in
+        tmpfs|ramfs|unknown) ;;
+        *)
+            if [[ ! -L /var/lib/guardian ]] && touch /var/lib/guardian/.w 2>/dev/null; then
+                rm -f /var/lib/guardian/.w
+                STATE_DIR="/var/lib/guardian"
+            fi ;;
+    esac
+    if [[ -z "$STATE_DIR" ]]; then
+        install -d -m 0750 "$RUN_DIR" 2>/dev/null
+        STATE_DIR="$RUN_DIR"
+        STATE_VOLATILE=true
+        warn "Estado NO persistente (/var/lib/guardian no disponible): el aviso se perderá al reiniciar"
+    fi
+}
+
+leer_early() {
+    EARLY_STATUS="none"
+    if [[ -r "$RUN_DIR/early_status" ]]; then
+        EARLY_STATUS=$(head -n1 "$RUN_DIR/early_status" 2>/dev/null || echo none)
+    fi
+}
+
+# ─── Voz: sesión de usuario si existe; si no, ALSA directo como root ──
+detectar_audio_usuario() {
+    local s uid
+    for s in /run/user/*/pulse/native; do
+        [[ -S "$s" ]] || continue
+        uid="${s#/run/user/}"; uid="${uid%%/*}"
+        PULSE_USER=$(id -nu "$uid" 2>/dev/null || true)
+        if [[ -n "$PULSE_USER" && "$uid" != "0" ]]; then PULSE_UID="$uid"; return 0; fi
+    done
+    return 0
+}
+
+_say() {
+    if [[ -n "$PULSE_UID" ]] && command -v runuser &>/dev/null; then
+        runuser -u "$PULSE_USER" -- env XDG_RUNTIME_DIR="/run/user/$PULSE_UID" "$@" 2>/dev/null && return 0
+    fi
+    "$@" 2>/dev/null
+}
+
+hablar() {
+    $NO_VOICE && return 0
+    local msg="$1"
+    if command -v espeak-ng &>/dev/null; then
+        _say timeout 20 espeak-ng -v es+f3 -p 16 -s 180 -a 90 "$msg" && return 0
+        _say timeout 20 espeak-ng -v es -p 16 -s 180 -a 90 "$msg" && return 0
+    fi
+    if command -v espeak &>/dev/null; then
+        _say timeout 20 espeak -v es -p 16 -s 180 -a 90 "$msg" && return 0
+    fi
+    if command -v pico2wave &>/dev/null && command -v aplay &>/dev/null; then
+        local tmp; tmp=$(mktemp /run/guardian-voice.XXXXXX.wav 2>/dev/null) || return 0
+        pico2wave -l es-ES -w "$tmp" "$msg" 2>/dev/null && aplay -q "$tmp" 2>/dev/null
+        rm -f "$tmp"
+    fi
+    return 0
+}
+
+musica_iniciar() {
+    $NO_MUSIC && return 0
+    [[ -f "$MUSIC_FILE" && ! -L "$MUSIC_FILE" ]] || return 0
+    command -v paplay &>/dev/null || return 0
+    [[ -n "$PULSE_UID" ]] || return 0
+    runuser -u "$PULSE_USER" -- env XDG_RUNTIME_DIR="/run/user/$PULSE_UID" \
+        bash -c "while true; do paplay --volume=28000 '$MUSIC_FILE' || break; done" &>/dev/null &
+    MUSIC_PID=$!
+    return 0
+}
+
+musica_detener() {
+    if [[ -n "${MUSIC_PID:-}" ]]; then
+        kill "$MUSIC_PID" 2>/dev/null
+        wait "$MUSIC_PID" 2>/dev/null
+        pkill -f "tema_guardian.ogg" 2>/dev/null
+    fi
+    MUSIC_PID=""
+    return 0
+}
+
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --dry-run|-n) DRY_RUN=true ;;
+            --verbose|-v) VERBOSE=true ;;
+            --skip-fsck)  SKIP_FSCK=true ;;
+            --no-music)   NO_MUSIC=true ;;
+            --no-voice)   NO_VOICE=true ;;
+            --safe)       SAFE=true ;;
+            --estado)     cat /var/lib/guardian/estado.txt 2>/dev/null || echo "Aún no hay estado (o usa sudo guardian --estado)."; exit 0 ;;
+            --no-packages) NO_PACKAGES=true ;;
+            --help|-h)
+                cat << HELP
+UNILINUX GUARDIAN v$VERSION — reparador de sistemas Linux, fase tardía (bash)
+Autores: Ahau Quetzalcóatl y Claude
+Uso: guardian [opciones]
+  --dry-run, -n   Solo simula
+  --safe          Solo diagnóstico, sin cambios ni estado
+  --skip-fsck     No revisa filesystems
+  --no-packages   No revisa ni repara paquetes (el servicio de arranque lo usa:
+                  apt/pacman pueden tardar y retrasarían el login)
+  --estado        Muestra el resumen del último chequeo (usa sudo)
+  --no-music  --no-voice  --verbose  --help
+Pareja: guardian-early (initramfs, fsck de la raíz)
+HELP
+                exit 0 ;;
+            *) echo "Opción desconocida: $1"; exit 1 ;;
+        esac
+        shift
+    done
+}
+
+adquirir_lock() {
+    exec 9>"$LOCKFILE" || { err "No se pudo abrir $LOCKFILE"; exit 1; }
+    if ! flock -n 9; then
+        err "Otra instancia de Guardian está corriendo"
+        exit 1
+    fi
+    trap 'rc=$?; musica_detener; exit $rc' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+}
+
+# ¿Está montado el dispositivo (o algo dentro de él)?
+esta_montado() {
+    local dev="$1" mp fm
+    mp=$(lsblk -rno MOUNTPOINT "$dev" 2>/dev/null | tr -d '[:space:]' || true)
+    fm=$(findmnt -rn -S "$dev" 2>/dev/null || true)
+    [[ -n "$mp" || -n "$fm" ]]
+}
+
+# ─── Diagnósticos ─────────────────────────────────────────────
+resolver_dev() {
+    local spec="$1"
+    case "$spec" in
+        /dev/*) echo "$spec" ;;
+        *=*)    findfs "$spec" 2>/dev/null || true ;;
+        *)      echo "" ;;
+    esac
+}
+
+# El log del early vive en /run (tmpfs): se pierde al apagar. Si hubo reparación (o fallo), se guarda
+# una copia en /var/log/guardian para poder ver DESPUÉS qué cambió (inodos, lost+found, clones...).
+INFORME_EARLY=""
+guardar_informe_early() {
+    $SAFE && return 0; $DRY_RUN && return 0
+    case "$EARLY_STATUS" in forced|failed|repaired) ;; *) return 0 ;; esac
+    local src="${GUARDIAN_EARLY_LOG:-$RUN_DIR/early.log}"   # GUARDIAN_EARLY_LOG: solo para pruebas
+    [[ -r "$src" && -n "${LOG_FILE:-}" ]] || return 0
+    local dest="${LOG_FILE%/*}/early_$(date +%Y%m%d_%H%M%S).log"
+    if install -m 0640 -o root -g root "$src" "$dest" 2>/dev/null; then
+        INFORME_EARLY="$dest"
+    elif cp "$src" "$dest" 2>/dev/null; then
+        INFORME_EARLY="$dest"
+    fi
+    return 0
+}
+
+diagnosticar_early() {
+    hdr "RAÍZ (fase early)"
+    case "$EARLY_STATUS" in
+        ok)       ok "Raíz verificada en initramfs: limpia" ;;
+        repaired) ok "Raíz reparada en initramfs"; LISTA_REPARADOS+=("raíz (early)") ;;
+        forced)
+            local bk="" bkd bkf
+            if [[ -r "$RUN_DIR/early_backup" ]]; then
+                bkd=$(sed -n 's/^BACKUP_DEV=//p' "$RUN_DIR/early_backup"); bkf=$(sed -n 's/^BACKUP_FILE=//p' "$RUN_DIR/early_backup")
+                local bkm bkl
+                bkm=$(sed -n 's/^META_FILE=//p' "$RUN_DIR/early_backup"); bkl=$(sed -n 's/^FSCK_LOG=//p' "$RUN_DIR/early_backup")
+                [[ -n "$bkf$bkm" ]] && bk="Respaldo en la partición UUID=${bkd:-?}: ${bkf:+deshacer=${bkf}}${bkf:+${bkm:+, }}${bkm:+metadatos=${bkm}}${bkl:+, informe=${bkl}}"
+            fi
+            warn "La raíz tenía un daño que -p no podía arreglar: early la reparó de forma FORZADA (-y)"
+            LISTA_REPARADOS+=("raíz (early, reparación FORZADA)")
+            if [[ -n "$bk" ]]; then LISTA_AVISOS+=("Reparación forzada de la raíz. $bk")
+            else LISTA_AVISOS+=("Reparación forzada de la raíz SIN respaldo (no había espacio). Revisa lost+found y tus archivos"); fi ;;
+        failed)   err "La raíz tiene errores que early no pudo reparar" ;;
+        skipped)  info "Early omitió la raíz (hibernación, no-ext, o sin herramientas)" ;;
+        *)        info "Early no dejó estado (¿no corrió?)" ;;
+    esac
+    guardar_informe_early
+    [[ -n "$INFORME_EARLY" ]] && info "Informe de lo que hizo early (qué cambió): $INFORME_EARLY"
+}
+
+diagnosticar_discos() {
+    hdr "DISCOS"
+    local d model size critical
+    while read -r d; do
+        [[ -b "$d" ]] || continue
+        model=$(lsblk -ndo MODEL "$d" 2>/dev/null | xargs || true)
+        size=$(lsblk -ndo SIZE "$d" 2>/dev/null || true)
+        info "$d | ${model:-?} | ${size:-?}"
+        if [[ "$d" == *nvme* ]] && command -v nvme &>/dev/null; then
+            critical=$(nvme smart-log "$d" 2>/dev/null | awk '/critical_warning/ {print $3}' || true)
+            if [[ -z "$critical" || "$critical" =~ ^(0|0x0|0x00)$ ]]; then
+                ok "NVMe $d SMART OK"
+            else
+                warn "NVMe $d critical_warning=$critical"
+                LISTA_AVISOS+=("SMART $d critical_warning=$critical")
+            fi
+        fi
+    done < <(lsblk -lnpo NAME,TYPE 2>/dev/null | awk '$2=="disk"{print $1}')
+    return 0
+}
+
+# Solo entradas de fstab ext2/3/4 que estén DESMONTADAS (la raíz y lo montado no se tocan)
+diagnosticar_fs() {
+    $SKIP_FSCK && { info "Revisión de filesystems omitida"; return 0; }
+    hdr "FILESYSTEMS (fstab, solo desmontados)"
+    [[ -r /etc/fstab ]] || { info "Sin /etc/fstab"; return 0; }
+    local spec mnt type dev state
+    while read -r spec mnt type _; do
+        [[ -z "$spec" || "$spec" == \#* ]] && continue
+        case "$type" in ext2|ext3|ext4) ;; *) continue ;; esac
+        dev=$(resolver_dev "$spec")
+        [[ -n "$dev" && -b "$dev" ]] || continue
+        if esta_montado "$dev" </dev/null; then
+            info "$dev ($mnt) montado → no se toca"
+            continue
+        fi
+        state=$(dumpe2fs -h "$dev" </dev/null 2>/dev/null | awk -F': *' '/^Filesystem state/{print $2}' || true)
+        if [[ "$state" == "clean" ]]; then
+            ok "$dev limpio"
+        else
+            warn "$dev estado='${state:-desconocido}' → necesita revisión"
+            PEND["fs:$dev"]=1
+        fi
+    done < /etc/fstab
+    return 0
+}
+
+# Carpeta de GRUB: /boot/grub (Debian, Ubuntu, Arch) o /boot/grub2 (openSUSE, Fedora). (4.18.5)
+grub_dir_detectar() {
+    local b="${1:-/boot}"
+    if [[ ! -d "$b/grub" && -d "$b/grub2" ]]; then echo "$b/grub2"; else echo "$b/grub"; fi
+}
+GRUB_DIR="${GUARDIAN_GRUB_DIR:-$(grub_dir_detectar)}"
+
+# Comando que regenera /boot/grub/grub.cfg en este sistema (vacío si no hay ninguno):
+#   Debian/Ubuntu: update-grub      Arch: grub-mkconfig -o /boot/grub/grub.cfg
+grub_regen() {
+    if command -v update-grub &>/dev/null; then echo "update-grub"
+    elif command -v grub-mkconfig &>/dev/null; then echo "grub-mkconfig -o ${GRUB_DIR}/grub.cfg"
+    elif command -v grub2-mkconfig &>/dev/null; then echo "grub2-mkconfig -o ${GRUB_DIR}/grub.cfg"
+    fi
+    return 0
+}
+
+diagnosticar_grub() {
+    hdr "BOOTLOADER"
+    if [[ -d /sys/firmware/efi/efivars ]] && command -v efibootmgr &>/dev/null; then
+        if efibootmgr &>/dev/null; then ok "Variables EFI accesibles"
+        else LISTA_AVISOS+=("efibootmgr no puede leer las variables EFI"); info "efibootmgr falló (aviso)"; fi
+    fi
+    # Solo se considera problema reparable si hay /boot/grub pero falta el grub.cfg
+    if [[ -d ${GRUB_DIR} && ! -f ${GRUB_DIR}/grub.cfg && -n "$(grub_regen)" ]]; then
+        warn "Falta ${GRUB_DIR}/grub.cfg"
+        PEND["grub"]=1
+    else
+        ok "Configuración de arranque sin problemas detectables"
+    fi
+    return 0
+}
+
+# Gestor de paquetes de ESTE sistema: dpkg | pacman | "" (GUARDIAN_PKG: solo pruebas).
+# Se mira también la base de datos, porque Debian puede tener el programa pacman instalado y viceversa.
+gestor_paquetes() {
+    if [[ -n "${GUARDIAN_PKG:-}" ]]; then echo "$GUARDIAN_PKG"; return 0; fi
+    if command -v dpkg &>/dev/null && [[ -f /var/lib/dpkg/status ]]; then echo dpkg
+    elif command -v pacman &>/dev/null && [[ -d /var/lib/pacman/local ]]; then echo pacman
+    elif command -v rpm &>/dev/null && rpm_db_presente; then echo rpm
+    elif command -v apk &>/dev/null && [[ -f "${GUARDIAN_APKDB:-/lib/apk/db/installed}" ]]; then echo apk
+    elif command -v xbps-query &>/dev/null && [[ -d "${GUARDIAN_XBPSDB:-/var/db/xbps}" ]]; then echo xbps
+    elif command -v emerge &>/dev/null && [[ -d "${GUARDIAN_PORTAGEDB:-/var/db/pkg}" ]]; then echo portage
+    elif command -v nix-store &>/dev/null && [[ -d "${GUARDIAN_NIXDB:-/nix/var/nix/db}" ]]; then echo nix
+    elif command -v dpkg &>/dev/null; then echo dpkg
+    fi
+    return 0
+}
+
+# ¿Hay algún programa usando la base de datos de pacman ahora mismo?
+pacman_en_uso() {
+    local p
+    for p in pacman pamac pamac-daemon packagekitd yay paru pikaur octopi; do
+        pgrep -x "$p" &>/dev/null && return 0
+    done
+    return 1
+}
+
+# Candado de pacman huérfano = es anterior a este arranque Y nadie lo está usando.
+pacman_lock_huerfano() {
+    local lock="$1" up mt now
+    [[ -e "$lock" ]] || return 1
+    pacman_en_uso && return 1
+    read -r up _ </proc/uptime 2>/dev/null || return 1
+    mt=$(stat -c %Y "$lock" 2>/dev/null) || return 1
+    now=$(date +%s)
+    (( mt < now - ${up%%.*} - 5 ))
+}
+
+diagnosticar_pacman() {
+    local lock="${GUARDIAN_PACMAN_LOCK:-/var/lib/pacman/db.lck}" out n   # GUARDIAN_PACMAN_LOCK: solo pruebas
+    if [[ -e "$lock" ]]; then
+        if pacman_lock_huerfano "$lock"; then
+            warn "Candado de pacman huérfano ($lock): quedó de un arranque anterior y nadie lo usa"
+            PEND["pacman-lock"]=1
+        else
+            info "pacman (u otro gestor) está trabajando o el candado es de este arranque → no se toca"
+        fi
+    fi
+    # pacman -Dk solo LEE la base de datos local: comprueba que no falten dependencias ni haya conflictos
+    if out=$(pacman -Dk 2>&1); then
+        ok "Base de datos de pacman coherente (pacman -Dk)"
+    else
+        n=$(grep -c . <<<"$out" || true)
+        log "pacman -Dk: $out"
+        warn "pacman -Dk encontró ${n:-?} problema(s) en la base de datos de paquetes"
+        LISTA_AVISOS+=("pacman -Dk informa ${n:-?} problema(s) de dependencias (no se repara solo; revisa con: pacman -Dk)")
+    fi
+    return 0
+}
+
+# ─── rpm (openSUSE, Fedora...): SOLO diagnóstico; nunca reescribe la base (4.18.5) ───
+rpm_db_presente() {
+    local d
+    for d in ${GUARDIAN_RPMDB_DIRS:-/usr/lib/sysimage/rpm /var/lib/rpm}; do
+        [[ -d "$d" ]] && return 0
+    done
+    return 1
+}
+
+diagnosticar_rpm() {
+    local out n vdb
+    # Con zypper/dnf trabajando no se mira (sus candados viven en /run y se vacían al arrancar)
+    if pgrep -x 'rpm|zypper|dnf|dnf5|yum|rpm-ostree' &>/dev/null; then
+        info "Hay un gestor de paquetes rpm trabajando → no se revisa ahora"
+        return 0
+    fi
+    if ! out=$(LC_ALL=C timeout 60 rpm -q rpm 2>&1); then
+        log "rpm -q rpm: $out"
+        warn "No se puede leer la base de datos de rpm"
+        LISTA_AVISOS+=("La base de datos de rpm no se puede leer (no se repara sola; revisa con: sudo rpmdb --verifydb)")
+        return 0
+    fi
+    # verifydb solo LEE: comprueba la integridad de la base
+    if command -v rpmdb &>/dev/null; then vdb="rpmdb --verifydb"; else vdb="rpm --verifydb"; fi
+    if out=$(LC_ALL=C timeout 300 $vdb 2>&1); then
+        ok "Base de datos de rpm íntegra ($vdb)"
+    else
+        log "$vdb: $out"
+        warn "$vdb encontró problemas en la base de datos de rpm"
+        LISTA_AVISOS+=("La base de datos de rpm tiene problemas (no se repara sola; revisa con: sudo $vdb)")
+    fi
+    # Dependencias sin cumplir (como pacman -Dk): solo LEE, sin mirar archivos
+    if out=$(LC_ALL=C timeout 300 rpm -Va --nofiles --nodigest --nosignature --noscripts 2>&1); then
+        ok "Dependencias de rpm completas (rpm -Va --nofiles)"
+    else
+        n=$(grep -c -i 'is needed by' <<<"$out" || true)
+        [[ "$n" == 0 ]] && n=$(grep -c . <<<"$out" || true)
+        log "rpm -Va --nofiles: $out"
+        warn "rpm -Va --nofiles encontró ${n:-?} problema(s) de dependencias"
+        LISTA_AVISOS+=("rpm informa ${n:-?} problema(s) de dependencias (no se repara solo; revisa con: rpm -Va --nofiles)")
+    fi
+    return 0
+}
+
+# ─── snapper (btrfs): ¿hay a dónde volver atrás? ¿arrancó desde un snapshot ro? (4.18.5) ───
+diagnosticar_snapper() {
+    command -v snapper &>/dev/null || return 0
+    [[ "$(findmnt -n -o FSTYPE / 2>/dev/null)" == btrfs ]] || return 0
+    hdr "SNAPSHOTS (snapper)"
+    local opts out n
+    opts=$(findmnt -n -o OPTIONS / 2>/dev/null)
+    if [[ ",$opts," == *,ro,* ]] && ! command -v transactional-update &>/dev/null; then
+        warn "El sistema arrancó desde un snapshot de solo lectura (vuelta atrás desde el menú de GRUB)"
+        LISTA_AVISOS+=("Arrancaste desde un snapshot de solo lectura. Si todo va bien, hazlo permanente con: sudo snapper rollback (y reinicia)")
+    fi
+    if out=$(LC_ALL=C timeout 60 snapper --no-dbus --csvout list --columns number 2>/dev/null); then
+        n=$(grep -c -E '^[1-9][0-9]*$' <<<"$out" || true)
+        if [[ "${n:-0}" -gt 0 ]]; then
+            ok "snapper: $n snapshot(s) para volver atrás"
+        else
+            warn "snapper no tiene snapshots: no hay a dónde volver atrás"
+            LISTA_AVISOS+=("snapper no tiene snapshots (crea uno con: sudo snapper create -d guardian)")
+        fi
+    else
+        info "No se pudo leer la lista de snapper"
+    fi
+    return 0
+}
+
+# (4.18.5) apk (Alpine): base legible, archivos de sistema intactos y dependencias completas
+diagnosticar_apk() {
+    local out n
+    if pgrep -x apk &>/dev/null; then
+        info "Hay un apk trabajando → no se revisan los paquetes ahora"
+        return 0
+    fi
+    if ! out=$(LC_ALL=C timeout 60 apk info 2>&1); then
+        log "apk info: $out"
+        warn "No se puede leer la base de datos de apk"
+        LISTA_AVISOS+=("La base de datos de apk no se puede leer (prueba: apk fix)")
+        return 0
+    fi
+    n=$(grep -c . <<<"$out" || true)
+    ok "Base de datos de apk legible (${n:-?} paquetes)"
+    if out=$(LC_ALL=C timeout 300 apk audit --system 2>&1) && [[ -z "$(grep -v '^[[:space:]]*$' <<<"$out")" ]]; then
+        ok "Archivos de sistema de los paquetes intactos (apk audit --system)"
+    else
+        n=$(grep -c -E '^[A-Z] ' <<<"$out" || true)
+        log "apk audit --system: $out"
+        warn "apk audit --system: ${n:-?} archivo(s) de sistema cambiado(s) o ausente(s)"
+        LISTA_AVISOS+=("apk: ${n:-?} archivo(s) de sistema cambiado(s) o ausente(s) (ver: apk audit --system; arreglo: apk fix)")
+    fi
+    if out=$(LC_ALL=C timeout 120 apk add --simulate --no-network 2>&1); then
+        ok "Dependencias de apk completas (apk add --simulate)"
+    else
+        log "apk add --simulate --no-network: $out"
+        warn "apk no puede cumplir lo instalado: $(grep -m1 'ERROR' <<<"$out" | cut -c1-60)"
+        LISTA_AVISOS+=("apk tiene dependencias rotas (ver: apk add --simulate)")
+    fi
+    return 0
+}
+
+# (4.18.5) xbps (Void): base legible y archivos/dependencias de los paquetes (xbps-pkgdb -a)
+diagnosticar_xbps() {
+    local out n pk
+    if pgrep -x 'xbps-(install|remove|reconfigure)' &>/dev/null; then
+        info "Hay un xbps trabajando → no se revisan los paquetes ahora"
+        return 0
+    fi
+    if ! out=$(LC_ALL=C timeout 60 xbps-query -l 2>&1); then
+        log "xbps-query -l: $out"
+        warn "No se puede leer la base de datos de xbps"
+        LISTA_AVISOS+=("La base de datos de xbps no se puede leer (prueba: xbps-pkgdb -a)")
+        return 0
+    fi
+    n=$(grep -c . <<<"$out" || true)
+    ok "Base de datos de xbps legible (${n:-?} paquetes)"
+    if out=$(LC_ALL=C timeout 300 xbps-pkgdb -a 2>&1); then
+        ok "Archivos y dependencias de los paquetes intactos (xbps-pkgdb -a)"
+    else
+        n=$(grep '^ERROR: ' <<<"$out" | grep -vc 'check FAILED' || true)
+        pk=$(grep -oE '^ERROR: [^: ]+:' <<<"$out" | sed 's/^ERROR: //; s/:$//' | sort -u | head -n 5 | tr '\n' ' ')
+        pk=${pk% }
+        log "xbps-pkgdb -a: $out"
+        warn "xbps-pkgdb -a: ${n:-?} problema(s) en: ${pk:-?}"
+        LISTA_AVISOS+=("xbps: ${n:-?} problema(s) en paquetes (${pk:-?}) (ver: xbps-pkgdb -a; arreglo: xbps-install -f PAQUETE)")
+    fi
+    return 0
+}
+
+# (4.18.5) portage (Gentoo): base legible y archivos de los paquetes (qcheck de app-portage/portage-utils).
+# Se ignoran /etc (configuración), /usr/src (fuentes del kernel) y las diferencias solo de fecha (MTIME):
+# en un Gentoo sano qcheck ya da rc=1 por esas (medido en gentoo-lab2).
+diagnosticar_portage() {
+    local db="${GUARDIAN_PORTAGEDB:-/var/db/pkg}" n out malos pk
+    if pgrep -x emerge &>/dev/null; then
+        info "Hay un emerge trabajando → no se revisan los paquetes ahora"
+        return 0
+    fi
+    n=$(find "$db" -mindepth 2 -maxdepth 2 -type d 2>/dev/null | wc -l)
+    if (( n == 0 )); then
+        warn "No se puede leer la base de datos de portage ($db)"
+        LISTA_AVISOS+=("La base de datos de portage ($db) está vacía o no se puede leer")
+        return 0
+    fi
+    ok "Base de datos de portage legible ($n paquetes)"
+    if ! command -v qcheck &>/dev/null; then
+        info "qcheck (app-portage/portage-utils) no está: no se revisan los archivos de los paquetes"
+        return 0
+    fi
+    out=$(LC_ALL=C timeout 300 qcheck 2>&1 | sed 's/\x1b\[[0-9;]*m//g')
+    malos=$(awk '
+        /^Checking / { p = $2; next }
+        /^[[:space:]]+(AFK|[A-Z0-9]+-DIGEST):[[:space:]]/ {
+            f = $0; sub(/^[[:space:]]+[A-Z0-9-]+:[[:space:]]+/, "", f)
+            if (f ~ /^\/etc\// || f ~ /^\/usr\/src\//) next
+            print p "\t" f
+        }' <<<"$out")
+    if [[ -z "$malos" ]]; then
+        ok "Archivos de los paquetes intactos (qcheck; sin contar /etc, /usr/src ni fechas)"
+    else
+        n=$(grep -c . <<<"$malos")
+        pk=$(cut -f1 <<<"$malos" | sed -E 's/-[0-9][^/]*$//' | sort -u | head -n 5 | tr '\n' ' ')
+        pk=${pk% }
+        log "qcheck: $malos"
+        warn "qcheck: $n archivo(s) cambiado(s) o ausente(s) en: $pk"
+        LISTA_AVISOS+=("portage: $n archivo(s) cambiado(s) o ausente(s) en paquetes ($pk) (ver: qcheck -B; arreglo: emerge -1 PAQUETE)")
+    fi
+    return 0
+}
+
+# (4.18.5) Nix (NixOS): integridad de /nix/store con «nix-store --verify --check-contents» (medido en
+# nixos-lab1: 6 s el sistema entero; cada ruta alterada sale como «path '/nix/store/…' was modified!»,
+# rc=1; «nix-store --repair-path RUTA» la baja de nuevo de la caché y la deja sana).
+diagnosticar_nix() {
+    local out rc mod n pk
+    if pgrep -f 'nixos-rebuild|nix-collect-garbage|nix-store --gc|nix-store --optimise|nix-build|nix-env ' &>/dev/null; then
+        info "Nix está trabajando (nixos-rebuild, nix-build, nix-env o el recolector) → no se revisa la tienda ahora"
+        return 0
+    fi
+    out=$(LC_ALL=C timeout 600 nix-store --verify --check-contents 2>&1); rc=$?
+    mod=$(sed -n "s#^path '\(/nix/store/[^']*\)' was modified!.*#\1#p" <<<"$out")
+    if [[ -n "$mod" ]]; then
+        n=$(grep -c . <<<"$mod")
+        pk=$(sed -E 's#^/nix/store/[a-z0-9]{32}-##' <<<"$mod" | sort -u | head -n 5 | tr '\n' ' ')
+        pk=${pk% }
+        log "nix-store --verify: $mod"
+        warn "Tienda de Nix: $n ruta(s) modificada(s): $pk"
+        LISTA_AVISOS+=("nix: $n ruta(s) de /nix/store modificada(s) ($pk) (arreglo: sudo nix-store --repair-path RUTA)")
+    elif (( rc == 0 )); then
+        ok "Tienda de Nix intacta (nix-store --verify --check-contents)"
+    elif (( rc == 124 )); then
+        info "nix-store --verify tardó más de 10 min: no se terminó la revisión de la tienda"
+    else
+        warn "nix-store --verify falló (rc=$rc): $(grep -v '^checking' <<<"$out" | grep -m1 . | cut -c1-80)"
+        LISTA_AVISOS+=("nix: nix-store --verify falló (rc=$rc) (ver: sudo nix-store --verify --check-contents)")
+    fi
+    return 0
+}
+
+diagnosticar_paquetes() {
+    hdr "PAQUETES"
+    if $NO_PACKAGES; then info "Paquetes omitidos (--no-packages)"; return 0; fi
+    case "$(gestor_paquetes)" in
+        dpkg) ;;
+        pacman) diagnosticar_pacman; return 0 ;;
+        rpm) diagnosticar_rpm; return 0 ;;
+        apk) diagnosticar_apk; return 0 ;;
+        xbps) diagnosticar_xbps; return 0 ;;
+        portage) diagnosticar_portage; return 0 ;;
+        nix) diagnosticar_nix; return 0 ;;
+        *) info "Sin gestor de paquetes conocido (dpkg, pacman o rpm)"; return 0 ;;
+    esac
+    local audit
+    audit=$(dpkg --audit 2>/dev/null || true)
+    if [[ -n "$audit" ]]; then
+        warn "dpkg inconsistente"
+        PEND["dpkg"]=1
+    else
+        ok "dpkg limpio"
+    fi
+    return 0
+}
+
+diagnosticar_espacio() {
+    diagnosticar_snapper
+    hdr "ESPACIO"
+    local fs blocks used avail pcent mount use
+    while read -r fs blocks used avail pcent mount; do
+        use="${pcent%\%}"
+        [[ "$use" =~ ^[0-9]+$ ]] || continue
+        if (( use > 93 )); then
+            warn "$mount al ${use}% — CRÍTICO"
+            LISTA_AVISOS+=("Espacio crítico en $mount (${use}%)")
+        elif (( use > 85 )); then
+            warn "$mount al ${use}%"
+        else
+            ok "$mount → ${use}%"
+        fi
+    done < <(df -P -x tmpfs -x devtmpfs -x squashfs -x overlay -x efivarfs -x erofs -x iso9660 -x cramfs 2>/dev/null | tail -n +2)
+    return 0
+}
+
+diagnosticar_red() {
+    hdr "RED (informativo)"
+    local links
+    links=$(ip link show 2>/dev/null || true)
+    if grep -q "state UP" <<<"$links"; then ok "Interfaces UP"; else info "Sin interfaces UP (informativo)"; fi
+    return 0
+}
+
+diagnosticar_firmware() {
+    hdr "FIRMWARE (informativo)"
+    local out
+    out=$(dmesg 2>/dev/null || true)
+    if grep -qi "firmware.*failed\|direct-loading failed" <<<"$out"; then
+        info "dmesg menciona firmware no cargado (común, p. ej. regulatory.db) — sin acción"
+    else
+        ok "Sin mensajes de firmware fallido"
+    fi
+    return 0
+}
+
+# ─── Reparaciones ─────────────────────────────────────────────
+reparar_fs() {
+    local key dev rc
+    for key in "${!PEND[@]}"; do
+        [[ "$key" == fs:* ]] || continue
+        dev="${key#fs:}"
+        hdr "REPARACIÓN FS $dev"
+        if esta_montado "$dev"; then info "$dev se montó mientras tanto → omitir"; continue; fi
+        if $DRY_RUN; then info "[DRY] e2fsck -p $dev"; continue; fi
+        e2fsck -p "$dev" &>>"${LOG_FILE:-/dev/null}"
+        rc=$?
+        if ! e2fsck_ok "$rc"; then
+            warn "Primer e2fsck -p falló (rc=$rc) → reintento una vez (sigue sin usar -y)"
+            e2fsck -p "$dev" &>>"${LOG_FILE:-/dev/null}"
+            rc=$?
+        fi
+        if e2fsck_ok "$rc"; then
+            ok "Reparado con -p (rc=$rc): $dev"
+            LISTA_REPARADOS+=("FS $dev")
+            unset 'PEND[$key]'
+        else
+            err "No se pudo reparar $dev con -p (rc=$rc). No se usa -y automático en esta fase."
+            FS_FALLIDOS+=("fs:$dev")
+        fi
+    done
+    return 0
+}
+
+reparar_paquetes() {
+    [[ -n "${PEND[dpkg]:-}" ]] || return 0
+    hdr "PAQUETES"
+    if $DRY_RUN; then info "[DRY] dpkg --configure -a; apt-get -f install"; return 0; fi
+    if pgrep -x apt &>/dev/null || pgrep -x apt-get &>/dev/null \
+       || pgrep -x dpkg &>/dev/null || pgrep -f unattended-upgr &>/dev/null; then
+        warn "Hay otro gestor de paquetes en ejecución → se pospone"
+        return 0
+    fi
+    local sim audit
+    timeout 300 dpkg --configure -a &>>"${LOG_FILE:-/dev/null}"
+    audit=$(dpkg --audit 2>/dev/null || true)
+    if [[ -n "$audit" ]]; then
+        sim=$(apt-get -s -f install 2>/dev/null || true)
+        if grep -q '^Remv' <<<"$sim"; then
+            warn "apt -f eliminaría paquetes → NO se ejecuta automáticamente"
+        else
+            DEBIAN_FRONTEND=noninteractive timeout 600 apt-get -f install -y &>>"${LOG_FILE:-/dev/null}"
+        fi
+    fi
+    audit=$(dpkg --audit 2>/dev/null || true)
+    if [[ -z "$audit" ]]; then
+        ok "Paquetes corregidos"
+        LISTA_REPARADOS+=("dpkg")
+        unset 'PEND[dpkg]'
+    else
+        warn "Los paquetes siguen inconsistentes"
+    fi
+    return 0
+}
+
+# Arch: lo único que se repara solo es el candado huérfano (impide usar pacman tras un apagón).
+reparar_pacman() {
+    [[ -n "${PEND[pacman-lock]:-}" ]] || return 0
+    local lock="${GUARDIAN_PACMAN_LOCK:-/var/lib/pacman/db.lck}"
+    hdr "PAQUETES (pacman)"
+    if $DRY_RUN; then info "[DRY] rm $lock"; return 0; fi
+    if ! pacman_lock_huerfano "$lock"; then
+        if [[ -e "$lock" ]]; then warn "El candado de pacman ya está en uso → se pospone"; return 0; fi
+    else
+        rm -f "$lock" 2>/dev/null
+    fi
+    if [[ ! -e "$lock" ]]; then
+        ok "Candado huérfano de pacman eliminado"
+        LISTA_REPARADOS+=("candado huérfano de pacman")
+        unset 'PEND[pacman-lock]'
+    else
+        warn "No se pudo quitar $lock"
+    fi
+    return 0
+}
+
+backup_grub() {
+    install -d -m 0750 "$GRUB_BACKUP_DIR" 2>/dev/null || return 0
+    local ts; ts=$(date +%Y%m%d_%H%M%S)
+    [[ -f ${GRUB_DIR}/grub.cfg ]] && cp -a ${GRUB_DIR}/grub.cfg "${GRUB_BACKUP_DIR}/grub.cfg.${ts}" 2>/dev/null
+    ls -1t "$GRUB_BACKUP_DIR"/grub.cfg.* 2>/dev/null | tail -n +$((MAX_GRUB_BACKUPS+1)) | xargs -r rm -f
+    return 0
+}
+
+reparar_grub() {
+    [[ -n "${PEND[grub]:-}" ]] || return 0
+    hdr "GRUB"
+    local cmd; cmd=$(grub_regen)
+    [[ -n "$cmd" ]] || { warn "No hay update-grub ni grub-mkconfig"; return 0; }
+    if $DRY_RUN; then info "[DRY] $cmd"; return 0; fi
+    backup_grub
+    # shellcheck disable=SC2086
+    $cmd &>>"${LOG_FILE:-/dev/null}"
+    if [[ -s ${GRUB_DIR}/grub.cfg ]]; then
+        ok "grub.cfg regenerado ($cmd)"
+        LISTA_REPARADOS+=("grub.cfg")
+        unset 'PEND[grub]'
+    else
+        err "$cmd no generó grub.cfg"
+    fi
+    return 0
+}
+
+# ─── Flag persistente "necesita atención" ─────────────────────
+# Se RECALCULA en cada ejecución: contiene "root" si early falló
+# (o si falló antes y early no dejó estado), y "fs:/dev/x" por cada FS
+# que -p no pudo reparar. Vacío → se borra.
+actualizar_flag() {
+    ( $DRY_RUN || $SAFE ) && return 0
+    local f="${STATE_DIR}/needs_attention" prev_root=false
+    local -a reasons=()
+    [[ -f "$f" ]] && grep -qx root "$f" 2>/dev/null && prev_root=true
+    case "$EARLY_STATUS" in
+        failed)   reasons+=("root") ;;
+        ok|repaired|forced) ;;
+        *)        $prev_root && reasons+=("root") ;;
+    esac
+    (( ${#FS_FALLIDOS[@]} > 0 )) && reasons+=("${FS_FALLIDOS[@]}")
+    if (( ${#reasons[@]} > 0 )); then
+        printf '%s\n' "${reasons[@]}" > "$f" 2>/dev/null
+        log "flag needs_attention: ${reasons[*]}"
+    else
+        rm -f "$f" 2>/dev/null
+    fi
+    return 0
+}
+
+# SMART de discos SATA/USB (el de los NVMe se revisa en detectar_discos). Solo avisa.
+diagnosticar_smart_sata() {
+    hdr "SMART (discos SATA/USB)"
+    if ! command -v smartctl &>/dev/null; then
+        info "smartctl no está instalado: no se revisa el SMART de discos SATA (instala el paquete smartmontools)"
+        return 0
+    fi
+    local d out health pend unc real msg model
+    while read -r d; do
+        [[ -b "$d" && "$d" != *nvme* && "$d" != *zram* && "$d" != *nbd* && "$d" != /dev/ram* ]] || continue
+        out=$(smartctl -H -A "$d" 2>/dev/null </dev/null || true)
+        if ! grep -q 'SMART' <<<"$out" || ! grep -qiE 'overall-health|Current_Pending' <<<"$out"; then
+            info "$d: SMART no disponible (adaptador USB o disco sin soporte)"
+            continue
+        fi
+        health=$(grep -i 'overall-health' <<<"$out" | awk -F': *' '{print $NF}' | head -n1)
+        pend=$(awk '$2=="Current_Pending_Sector"{print $NF}' <<<"$out" | head -n1)
+        unc=$(awk '$2=="Offline_Uncorrectable"{print $NF}' <<<"$out" | head -n1)
+        real=$(awk '$2=="Reallocated_Sector_Ct"{print $NF}' <<<"$out" | head -n1)
+        [[ "$pend" =~ ^[0-9]+$ ]] || pend=0
+        [[ "$unc"  =~ ^[0-9]+$ ]] || unc=0
+        [[ "$real" =~ ^[0-9]+$ ]] || real=0
+        model=$(lsblk -dno MODEL,SIZE "$d" 2>/dev/null </dev/null | xargs || true)
+        msg=""
+        grep -qi 'FAIL' <<<"$health" && msg="SMART reporta FALLO"
+        if (( pend > 0 || unc > 0 )); then
+            msg="${msg:+$msg; }sectores pendientes=$pend, no recuperables=$unc, reasignados=$real"
+        fi
+        if [[ -n "$msg" ]]; then
+            warn "$d (${model:-modelo desconocido}): $msg — el disco puede estar fallando, respalda tus datos"
+            LISTA_AVISOS+=("Disco $d (${model:-modelo desconocido}) con señales de fallo: $msg")
+        else
+            ok "$d (${model:-?}) SMART OK (reasignados=$real)"
+        fi
+    done < <(lsblk -dnpo NAME,TYPE 2>/dev/null | awk '$2=="disk"{print $1}')
+    return 0
+}
+
+banner() {
+    # El arte grande solo se muestra en una terminal real (no ensucia el journal de systemd)
+    if [[ -t 1 || "${GUARDIAN_BANNER:-0}" == "1" ]]; then
+        echo -e "${M}${BOLD}"
+        cat << 'ART'
+  █ █ █▄ █ █ █   █ █▄ █ █ █ ▀▄▀
+  █▄█ █ ▀█ █ █▄▄ █ █ ▀█ █▄█ █ █
+ART
+        echo -e "${N}${C}${BOLD}   ◆  G U A R D I A N  ◆${N}"
+        echo -e "${C}   Reparador de sistemas Linux${N}"
+        echo -e "${C}   Autores: Ahau Quetzalcóatl y Claude${N}"
+        echo ""
+    else
+        echo -e "${M}${BOLD}UNILINUX GUARDIAN${N} — Reparador de sistemas Linux (Ahau Quetzalcóatl y Claude)"
+    fi
+    echo -e "  v${VERSION} — fase tardía | Early: ${EARLY_STATUS}"
+    echo -e "  Estado: ${STATE_DIR:-?} | Log: ${LOG_FILE:-ninguno}"
+    $SAFE && echo -e "  ${Y}MODO SAFE (solo diagnóstico)${N}"
+    $DRY_RUN && echo -e "  ${Y}DRY-RUN${N}"
+    echo ""
+}
+
+# Resumen legible del último chequeo (para leer sin buscar en logs). No se escribe en --safe/--dry-run.
+escribir_estado() { # $1 = veredicto (texto), $2 = código de salida
+    $SAFE && return 0; $DRY_RUN && return 0
+    [[ -n "${STATE_DIR:-}" && -d "$STATE_DIR" ]] || return 0
+    local f="${STATE_DIR}/estado.txt" t a
+    t=$(mktemp "${STATE_DIR}/.estado.XXXXXX" 2>/dev/null) || return 0
+    {
+        echo "UNILINUX GUARDIAN v${VERSION} — último chequeo: $(date '+%Y-%m-%d %H:%M:%S')"
+        echo "RESULTADO: $1  (código $2)"
+        echo "Raíz (fase early): ${EARLY_STATUS}"
+        if (( ${#LISTA_REPARADOS[@]} > 0 )); then echo "REPARADO:"; for a in "${LISTA_REPARADOS[@]}"; do echo "  - $a"; done; fi
+        if (( ${#LISTA_AVISOS[@]} > 0 )); then echo "AVISOS:"; for a in "${LISTA_AVISOS[@]}"; do echo "  - $a"; done; fi
+        if (( ${#PEND[@]} > 0 )); then echo "PENDIENTE SIN RESOLVER:"; for a in "${!PEND[@]}"; do echo "  - $a"; done; fi
+        [[ -f "${STATE_DIR}/needs_attention" ]] && echo "ATENCIÓN: hay un problema de disco pendiente (se recordará en cada arranque)."
+        [[ -n "$INFORME_EARLY" ]] && echo "Informe de lo que cambió la reparación de la raíz: $INFORME_EARLY"
+        echo "Log completo: ${LOG_FILE:-ninguno}"
+    } >"$t" 2>/dev/null && chmod 0644 "$t" && mv -f "$t" "$f" || rm -f "$t"
+    return 0
+}
+
+main() {
+    parse_args "$@"
+    require_root
+    init_paths
+    adquirir_lock
+    leer_early
+    detectar_audio_usuario
+    banner
+    musica_iniciar
+
+    diagnosticar_early
+    diagnosticar_discos
+    diagnosticar_smart_sata
+    diagnosticar_fs
+    diagnosticar_grub
+    diagnosticar_paquetes
+    diagnosticar_espacio
+    diagnosticar_red
+    diagnosticar_firmware
+
+    if ! $SAFE; then
+        reparar_fs
+        $NO_PACKAGES || { reparar_paquetes; reparar_pacman; }
+        reparar_grub
+    fi
+    actualizar_flag
+
+    echo ""
+    local a pendientes=${#PEND[@]} early_failed=false
+    [[ "$EARLY_STATUS" == "failed" ]] && early_failed=true
+
+    for a in "${LISTA_AVISOS[@]}"; do warn "Aviso: $a"; done
+    if (( ${#LISTA_AVISOS[@]} > 0 )); then
+        hablar "Atención. Hay avisos de hardware o espacio en disco. Revisa el registro."
+    fi
+
+    if $early_failed; then
+        err "Raíz con errores sin reparar → hace falta USB live (e2fsck manual)"
+        hablar "El disco principal tiene errores que no se pudieron reparar automáticamente. Se necesita un USB de recuperación."
+    elif ! $SAFE && ! $DRY_RUN && [[ -f "${STATE_DIR}/needs_attention" ]]; then
+        # Recordatorio: hay un problema persistente de un arranque anterior aún sin resolver
+        warn "Hay un problema pendiente de arranques anteriores: $(tr '\n' ' ' < "${STATE_DIR}/needs_attention")"
+        hablar "Recordatorio. Hay un problema de disco pendiente de un arranque anterior. Se necesita revisión."
+    fi
+
+    if (( pendientes == 0 )) && ! $early_failed; then
+        # Códigos de salida: 0 = sano, 3 = sin errores de sistema pero con avisos de hardware,
+        # 1 = problemas sin resolver (más abajo).
+        local rc_final=0 navisos=${#LISTA_AVISOS[@]}
+        (( navisos > 0 )) && rc_final=3
+        if (( ${#LISTA_REPARADOS[@]} > 0 )); then
+            echo -e "  ${G}${BOLD}✅ Reparado:${N}"
+            for a in "${LISTA_REPARADOS[@]}"; do ok "$a"; done
+            (( navisos == 0 )) && hablar "Se realizaron reparaciones. El sistema está sano."
+        fi
+        if (( navisos > 0 )); then
+            echo -e "  ${Y}${BOLD}🟡 SIN ERRORES DE SISTEMA, PERO CON ${navisos} AVISO(S)${N}"
+        elif (( ${#LISTA_REPARADOS[@]} == 0 )); then
+            echo -e "  ${G}${BOLD}🟢 SISTEMA SANO${N}"
+            hablar "Sistema sano."
+        fi
+        local veredicto="SANO"
+        (( navisos > 0 )) && veredicto="SIN ERRORES DE SISTEMA, CON ${navisos} AVISO(S)"
+        (( navisos == 0 && ${#LISTA_REPARADOS[@]} > 0 )) && veredicto="SANO (se repararon cosas)"
+        escribir_estado "$veredicto" "$rc_final"
+        musica_detener
+        exit $rc_final
+    fi
+
+    if (( pendientes > 0 )); then
+        echo -e "  ${Y}${BOLD}Pendientes sin resolver: $pendientes${N}"
+        for a in "${!PEND[@]}"; do warn "→ $a"; done
+        if $SAFE; then hablar "Modo seguro. Solo diagnóstico."; else hablar "Quedaron problemas sin resolver."; fi
+    fi
+    info "Log: ${LOG_FILE:-ninguno}"
+    escribir_estado "CON PROBLEMAS SIN RESOLVER" 1
+    musica_detener
+    exit 1
+}
+
+# Permite `source guardian` en los tests sin ejecutar main
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi

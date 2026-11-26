@@ -1,0 +1,284 @@
+#!/bin/bash
+# instalar-minios v1.0 (Guardian 4.18.6) — Guardian en MiniOS (sistema live modular de Debian:
+# /minios/*.sb + initrd de dracut SIN systemd con livekit). La raíz es un overlay en RAM; lo que
+# se protege es la partición ext de DATOS (la que guarda /minios: módulos y cambios persistentes).
+# - El initrd oficial NO se regenera (sus módulos livekit no están en el sistema): se añade un
+#   SEGUNDO initrd, /minios/boot/guardian-early.img (cpio), que GRUB carga detrás del oficial:
+#     pre-mount/10  guardian-early con ROOT=UUID=<datos> (MiniOS no pasa root=), antes de que
+#                   livekit la monte (gancho mount/30); espera hasta 30 s al disco.
+#     pre-pivot/90  copia /run/guardian a $NEWROOT/run/guardian (livekit monta ahí un tmpfs nuevo).
+#   Lleva guardian-early, e2image y sus bibliotecas (del propio MiniOS) y early.conf. Guarda: ninguna
+#   ruta del cpio puede pasar por un ENLACE del initrd base (usr/lib/dracut/hooks lo es: sustituirlo
+#   deja el initrd sin ganchos y el arranque en emergencia — visto en QEMU).
+# - Fase tardía: módulo /minios/90-guardian.sb (install-guardian REAL en chroot sobre la unión de los
+#   módulos; la capa superior se empaqueta con mksquashfs).
+# - grub.cfg (y syslinux.cfg) de /minios/boot: añade el segundo initrd y from=/dev/disk/by-label/<ETIQ>/minios
+#   (sin from=, livekit monta en RW TODAS las particiones buscando /minios: visto en QEMU con señuelos).
+# Nada se sustituye hasta que las tres piezas nuevas están verificadas; las anteriores quedan con
+# sufijo .guardian-anterior.
+# Uso: sudo bash instalar-minios /dev/sdXN --sistema-confiable [--conf early.conf] [--early ruta] [--guardian ruta]
+VERSION="1.0"
+set -u
+MODULO=90-guardian.sb
+IMGX=guardian-early.img
+die() { echo "✖ $*" >&2; exit 1; }
+
+# >>> minios (funciones; GUARDIAN_MINIOS_FUNCIONES=1 las carga sin ejecutar main)
+mos_gancho_pre() { cat <<'GANCHO'
+#!/bin/sh
+# Guardian early (MiniOS): revisa la particion de DATOS (/minios) antes de que livekit la monte.
+# Lo lee el init de dracut con «.»: sin exit.
+if [ -x /usr/bin/guardian-early ] && [ -r /etc/guardian-minios.conf ]; then
+    GUARDIAN_DATOS=""
+    . /etc/guardian-minios.conf
+    _g_n=0
+    while [ -n "$GUARDIAN_DATOS" ] && [ -z "$(blkid -U "${GUARDIAN_DATOS#UUID=}" 2>/dev/null)" ] && [ "$_g_n" -lt 30 ]; do
+        sleep 1; _g_n=$((_g_n + 1))
+    done
+    [ -n "$GUARDIAN_DATOS" ] && ROOT="$GUARDIAN_DATOS" /usr/bin/guardian-early || :
+fi
+GANCHO
+}
+mos_gancho_pivot() { cat <<'GANCHO'
+#!/bin/sh
+# Guardian (MiniOS): livekit monta un tmpfs NUEVO en $NEWROOT/run (el /run del sistema), asi que
+# /run/guardian del initrd no llegaria. Se copia ahi antes del cambio de raiz. Lo lee el init: sin exit.
+_g_nr="${NEWROOT:-/sysroot}"
+if [ -d /run/guardian ] && [ -d "$_g_nr/run" ] && [ ! -e "$_g_nr/run/guardian" ]; then
+    mkdir -p "$_g_nr/run/guardian" 2>/dev/null && cp -a /run/guardian/. "$_g_nr/run/guardian/" 2>/dev/null || :
+fi
+GANCHO
+}
+# $1 = raíz de una imagen, $2 = ruta relativa. Escribe la ruta REAL relativa, resolviendo los enlaces
+# componente a componente DENTRO de la imagen (un enlace absoluto apunta a la raíz de la imagen).
+mos_resolver() {
+    local b="$1" rest="$2" out="" c l n=0
+    while [[ -n "$rest" ]]; do
+        c=${rest%%/*}
+        if [[ "$rest" == */* ]]; then rest=${rest#*/}; else rest=""; fi
+        case "$c" in
+            ''|.) continue ;;
+            ..) if [[ "$out" == */* ]]; then out=${out%/*}; else out=""; fi; continue ;;
+        esac
+        if [[ -L "$b/${out:+$out/}$c" ]]; then
+            n=$((n + 1)); (( n <= 20 )) || return 1
+            l=$(readlink "$b/${out:+$out/}$c")
+            case "$l" in /*) out=""; rest="${l#/}${rest:+/$rest}" ;; *) rest="$l${rest:+/$rest}" ;; esac
+        else
+            out="${out:+$out/}$c"
+        fi
+    done
+    echo "$out"
+}
+# $1 = initrd base desempaquetado. Escribe la carpeta REAL de los ganchos de dracut (relativa).
+mos_dir_ganchos() {
+    local b="$1" p r
+    for p in usr/lib/dracut/hooks lib/dracut/hooks; do
+        r=$(mos_resolver "$b" "$p") || continue
+        [[ -n "$r" && -d "$b/$r" && ! -L "$b/$r" ]] && { echo "$r"; return 0; }
+    done
+    return 1
+}
+# $1 = base desempaquetado, $2 = árbol del cpio extra. Escribe cada ruta del cpio que en la base es
+# (o cruza) un enlace; devuelve el nº de choques.
+mos_guarda_enlaces() {
+    local b="$1" o="$2" p q n=0
+    while IFS= read -r p; do
+        q=$p
+        while [[ -n "$q" && "$q" != . ]]; do
+            if [[ -L "$b/$q" ]]; then echo "$p (cruza el enlace $q)"; n=$((n + 1)); break; fi
+            q=$(dirname "$q")
+        done
+    done < <(cd "$o" && find . -mindepth 1 | sed 's|^\./||' | LC_ALL=C sort)
+    return "$n"
+}
+# Edita un grub.cfg/syslinux.cfg de MiniOS en la salida estándar. $1 = archivo, $2 = etiqueta (vacía: sin from=)
+# grub:     «initrd …/initrfs-X.img» → «initrd …/initrfs-X.img /minios/boot/guardian-early.img»
+#           «linux … boot=live …»   → + « from=/dev/disk/by-label/ETIQ/minios» (si no tiene from=)
+# syslinux: «initrd=…/initrfs-X.img» → «initrd=…/initrfs-X.img,/minios/boot/guardian-early.img»; APPEND … boot=live → + from=
+mos_editar_cfg() {
+    local f="$1" et="$2"
+    awk -v et="$et" -v x="/minios/boot/guardian-early.img" '
+    function tiene(s, w,   i, n, a) { n = split(s, a, /[ \t]+/); for (i = 1; i <= n; i++) if (a[i] ~ w) return 1; return 0 }
+    {
+        l = $0
+        if (l ~ /^[ \t]*initrd[ \t]/ && l ~ /initrfs/ && index(l, x) == 0) l = l " " x
+        if (l ~ /initrd=[^ \t]*initrfs/ && index(l, x) == 0) sub(/initrd=[^ \t]*initrfs[^ \t,]*/, "&," x, l)
+        if (et != "" && l ~ /^[ \t]*(linux|APPEND|append)[ \t]/ && l ~ /boot=live/ && !tiene(l, "^from=")) l = l " from=/dev/disk/by-label/" et "/minios"
+        print l
+    }' "$f"
+}
+# Piezas del cpio extra (ruta relativa, sin la carpeta de ganchos, que se resuelve aparte)
+MOS_PIEZAS=(usr/bin/guardian-early usr/bin/e2image etc/guardian-early.conf etc/guardian-minios.conf)
+# Piezas del módulo de la fase tardía (listado de unsquashfs -l, sin «squashfs-root/»)
+MOS_MOD_PIEZAS=(usr/lib/guardian/guardian usr/lib/guardian/guardian-early etc/guardian/early.conf
+                usr/lib/guardian/guardian-actualizar usr/local/sbin/guardian-actualizar
+                etc/systemd/system/guardian-late.service etc/systemd/system/multi-user.target.wants/guardian-late.service)
+# <<< minios
+
+mos_desempaquetar() {   # $1 imagen, $2 destino
+    local m; m=$(head -c 4 "$1" | od -An -tx1 | tr -d ' \n')
+    mkdir -p "$2" || return 1
+    case "$m" in
+        28b52ffd) zstd -dc "$1" ;;
+        1f8b*)    gzip -dc "$1" ;;
+        fd377a58) xz -dc "$1" ;;
+        30373037) cat "$1" ;;
+        *) echo "formato de initrd desconocido ($m)" >&2; return 1 ;;
+    esac | (cd "$2" && cpio -idm --quiet --no-absolute-filenames 2>/dev/null)
+    [[ -e "$2/init" ]]
+}
+
+main() {
+    local DEV="" conf=0 C="" e="" g=""
+    while (( $# )); do
+        case "$1" in
+            --sistema-confiable) conf=1; shift ;;
+            --conf) C=$2; shift 2 ;;
+            --early) e=$2; shift 2 ;;
+            --guardian) g=$2; shift 2 ;;
+            /dev/*) DEV=$1; shift ;;
+            *) die "Opción desconocida: $1" ;;
+        esac
+    done
+    [[ -n "$DEV" ]] || die "Uso: sudo bash $0 /dev/sdXN --sistema-confiable [--conf early.conf]"
+    [[ -b "$DEV" ]] || die "$DEV no es un dispositivo de bloques"
+    [[ $(id -u) -eq 0 ]] || die "Usa: sudo bash $0 $DEV --sistema-confiable"
+    (( conf == 1 )) || die "Requiere --sistema-confiable (el chroot EJECUTA programas de ese MiniOS)"
+    [[ -z "$(findmnt -rno TARGET -S "$DEV" 2>/dev/null)" ]] || die "$DEV está montado: desmóntalo antes"
+    local SRC; SRC=$(cd "$(dirname "$0")" && pwd)
+    [[ -n "$e" ]] || e=$SRC/guardian-early
+    [[ -n "$g" ]] || g=$SRC/guardian
+    local f; for f in "$e" "$g" "$SRC/install-guardian"; do [[ -f "$f" ]] || die "Falta $f"; done
+    [[ -z "$C" || -f "$C" ]] || die "No existe --conf $C"
+    for f in zstd cpio mksquashfs unsquashfs awk realpath; do command -v "$f" >/dev/null 2>&1 || die "Falta $f en este sistema"; done
+    local fs; fs=$(blkid -o value -s TYPE "$DEV" 2>/dev/null)
+    case "$fs" in ext2|ext3|ext4) ;; *) die "$DEV es '${fs:-?}': Guardian solo protege datos ext2/3/4" ;; esac
+    local UUID ET; UUID=$(blkid -o value -s UUID "$DEV"); ET=$(blkid -o value -s LABEL "$DEV")
+    [[ -n "$UUID" ]] || die "$DEV no tiene UUID"
+    if [[ -n "$ET" ]]; then
+        if [[ "$ET" =~ [^A-Za-z0-9_.-] ]]; then echo "  ⚠ la etiqueta «$ET» tiene caracteres raros: no pongo from="; ET=""
+        elif (( $(blkid -o device -t LABEL="$ET" 2>/dev/null | wc -l) != 1 )); then echo "  ⚠ la etiqueta «$ET» no es única: no pongo from="; ET=""; fi
+    else
+        echo "  ⚠ $DEV sin etiqueta: no pongo from= (livekit buscará /minios montando las particiones en rw)"
+    fi
+
+    W=$(mktemp -d /tmp/guardian-minios.XXXXXX) || die "mktemp"
+    mos_soltar() {
+        local m
+        for m in $(findmnt -rn -o TARGET 2>/dev/null | grep -F "$W" | sort -r); do umount "$m" 2>/dev/null || umount -l "$m"; done
+        rm -rf "$W" 2>/dev/null; return 0
+    }
+    trap mos_soltar EXIT
+    local D=$W/datos; mkdir -p "$D" "$W/base" "$W/ov" "$W/up" "$W/wk" "$W/u" "$W/sb"
+    mount "$DEV" "$D" || die "No pude montar $DEV"
+    [[ -d "$D/minios/boot" ]] || die "$DEV no tiene /minios/boot: ¿es la partición de datos de MiniOS?"
+    local KV INI VMZ n
+    n=$(ls -1 "$D"/minios/boot/initrfs-*.img 2>/dev/null | wc -l)
+    (( n == 1 )) || die "Esperaba 1 initrfs-*.img en /minios/boot y hay $n"
+    INI=$(ls -1 "$D"/minios/boot/initrfs-*.img); KV=${INI##*/initrfs-}; KV=${KV%.img}
+    VMZ=$D/minios/boot/vmlinuz-$KV; [[ -f "$VMZ" ]] || die "Falta vmlinuz-$KV"
+    echo "→ MiniOS en $DEV (UUID=$UUID${ET:+, etiqueta $ET}), kernel $KV"
+
+    # 1) unión de los módulos (sin el nuestro) y fase tardía REAL en chroot
+    local s low="" i=0
+    for s in $(cd "$D/minios" && ls -1 ./*.sb 2>/dev/null | sed 's|^\./||' | LC_ALL=C sort); do
+        [[ "$s" == "$MODULO" ]] && continue
+        mkdir -p "$W/sb/$i"; mount -o loop,ro "$D/minios/$s" "$W/sb/$i" || die "No pude montar el módulo $s"
+        low="$W/sb/$i${low:+:$low}"; i=$((i + 1))
+    done
+    (( i > 0 )) || die "No hay módulos .sb en /minios"
+    mount -t overlay overlay -o "lowerdir=$low,upperdir=$W/up,workdir=$W/wk" "$W/u" || die "No pude montar la unión de módulos"
+    [[ -f "$W/u/etc/os-release" && -x "$W/u/bin/bash" ]] || die "La unión de módulos no parece un MiniOS con bash"
+    echo "  ✔ unión de $i módulos: $(grep -m1 '^PRETTY_NAME' "$W/u/etc/os-release" | cut -d= -f2)"
+    if [[ -n "$C" ]]; then install -D -m 0644 "$C" "$W/u/etc/guardian/early.conf" || die "No pude poner early.conf"; fi
+    local GS=/root/guardian-src
+    install -d -m 0700 "$W/u$GS" && install -m 0755 "$g" "$W/u$GS/guardian" \
+        && install -m 0755 "$e" "$W/u$GS/guardian-early" && install -m 0755 "$SRC/install-guardian" "$W/u$GS/install-guardian" \
+        && install -m 0755 "$SRC/guardian-actualizar" "$W/u$GS/guardian-actualizar" \
+        || die "No pude copiar Guardian a la unión"
+    # MiniOS crea dev/proc/sys al arrancar (prepare_initramfs_dracut): en la unión pueden faltar.
+    # Los que se creen aquí van a la capa superior y se quitan antes de empaquetarla.
+    local PM=() pm; for pm in dev proc sys; do [[ -d "$W/u/$pm" ]] || { mkdir "$W/u/$pm" && PM+=("$pm"); } || die "No pude crear /$pm en la unión"; done
+    mount --bind /dev "$W/u/dev" && mount --bind /dev/pts "$W/u/dev/pts" && mount -t proc proc "$W/u/proc" \
+        && mount -t sysfs sys "$W/u/sys" || die "Montajes del chroot"
+    echo "→ Fase tardía: install-guardian en chroot (solo tardía)"
+    chroot "$W/u" /usr/bin/env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin HOME=/root TERM=dumb \
+        GUARDIAN_CHROOT=1 GUARDIAN_SOLO_TARDIA=1 /bin/bash "$GS/install-guardian" </dev/null \
+        || die "install-guardian falló en el chroot (no se tocó nada de /minios)"
+    # e2image y bibliotecas que el initrd base no trae (resueltas con el ldd del propio MiniOS)
+    local LIBS; LIBS=$(chroot "$W/u" /usr/bin/env -i PATH=/usr/bin:/bin ldd /usr/sbin/e2image 2>/dev/null | awk '$2=="=>" && $3 ~ /^\// {print $3}')
+    [[ -n "$LIBS" ]] || die "No pude resolver las bibliotecas de e2image en MiniOS"
+    rm -rf "$W/u$GS"
+    umount "$W/u/sys" "$W/u/proc" "$W/u/dev/pts" "$W/u/dev" || die "No pude soltar los montajes del chroot"
+
+    # 2) cpio extra
+    mos_desempaquetar "$INI" "$W/base" || die "No pude desempaquetar ${INI#"$D"}"
+    grep -q 'source_hook pre-mount' "$W/base/init" && grep -q 'source_hook pre-pivot' "$W/base/init" \
+        || die "El init del initrd no lee pre-mount y pre-pivot (no es el dracut esperado)"
+    [[ -f "$W/base/minios-init" ]] || die "El initrd no es de MiniOS (falta /minios-init)"
+    local HD; HD=$(mos_dir_ganchos "$W/base") || die "No encuentro la carpeta real de ganchos de dracut"
+    local bb; for bb in e2fsck blkid; do [[ -e "$W/base/usr/sbin/$bb" || -e "$W/base/usr/bin/$bb" || -e "$W/base/sbin/$bb" || -e "$W/base/bin/$bb" ]] || die "El initrd base no trae $bb"; done
+    local O=$W/ov
+    install -D -m 0755 "$e" "$O/usr/bin/guardian-early" && install -D -m 0755 "$W/u/usr/sbin/e2image" "$O/usr/bin/e2image" || die "cpio: binarios"
+    local lb dd
+    for lb in $LIBS; do
+        dd=$(mos_resolver "$W/base" "${lb#/}") && [[ -e "$W/base/$dd" ]] && continue
+        install -D -m 0644 "$(realpath "$W/u$lb")" "$O/usr/lib/x86_64-linux-gnu/${lb##*/}" || die "cpio: $lb"
+    done
+    install -D -m 0644 "$W/u/etc/guardian/early.conf" "$O/etc/guardian-early.conf" || die "cpio: early.conf"
+    printf '# Guardian (instalar-minios v%s): partición de DATOS de MiniOS que revisa guardian-early\nGUARDIAN_DATOS=UUID=%s\n' "$VERSION" "$UUID" > "$O/etc/guardian-minios.conf"
+    install -d "$O/$HD/pre-mount" "$O/$HD/pre-pivot"
+    mos_gancho_pre > "$O/$HD/pre-mount/10-guardian-early-hook.sh" && mos_gancho_pivot > "$O/$HD/pre-pivot/90-guardian-guardar.sh" \
+        && chmod 0755 "$O/$HD"/pre-*/*-guardian-*.sh || die "cpio: ganchos"
+    local ch; ch=$(mos_guarda_enlaces "$W/base" "$O") || die "El cpio pisaría enlaces del initrd base: ${ch//$'\n'/; }"
+    echo "  ✔ ningún archivo del cpio pisa un enlace del initrd base (ganchos en $HD)"
+    (cd "$O" && find . -mindepth 1 | sed 's|^\./||' | LC_ALL=C sort | cpio -o -H newc -R 0:0 --quiet) > "$W/$IMGX" || die "cpio falló"
+    mkdir -p "$W/chk"; (cd "$W/chk" && cpio -idm --quiet < "$W/$IMGX") || die "No pude releer el cpio"
+    local p
+    for p in "${MOS_PIEZAS[@]}" "$HD/pre-mount/10-guardian-early-hook.sh" "$HD/pre-pivot/90-guardian-guardar.sh"; do
+        cmp -s "$O/$p" "$W/chk/$p" || die "cpio: $p no coincide al releerlo"
+    done
+    cmp -s "$e" "$W/chk/usr/bin/guardian-early" || die "cpio: guardian-early distinto del instalado"
+    echo "  ✔ $IMGX: $(( $(stat -c %s "$W/$IMGX") / 1024 )) KB, ${#MOS_PIEZAS[@]} piezas + 2 ganchos verificados"
+
+    # 3) módulo de la fase tardía (capa superior, sin borrados de overlay)
+    umount "$W/u" || die "No pude soltar la unión"
+    [[ -z "$(find "$W/up" -type c 2>/dev/null | head -n 1)" ]] || die "La capa de install-guardian trae borrados (whiteouts): no se empaqueta"
+    rm -rf "$W/up/root/guardian-src" "$W/up/tmp" "$W/up/var/cache" 2>/dev/null
+    for pm in "${PM[@]}"; do rmdir "$W/up/$pm" 2>/dev/null || die "/$pm de la capa superior no quedó vacío"; done
+    mksquashfs "$W/up" "$W/$MODULO" -comp zstd -no-xattrs -noappend -quiet >/dev/null 2>&1 || die "mksquashfs falló"
+    local L; L=$(unsquashfs -l "$W/$MODULO" 2>/dev/null | sed 's|^squashfs-root/||')
+    for p in "${MOS_MOD_PIEZAS[@]}"; do grep -qx "$p" <<<"$L" || die "El módulo no trae $p"; done
+    echo "  ✔ $MODULO: $(( $(stat -c %s "$W/$MODULO") / 1024 )) KB, ${#MOS_MOD_PIEZAS[@]} piezas"
+
+    # 4) configuración de arranque de /minios/boot
+    local CF=() c
+    while IFS= read -r c; do CF+=("$c"); done < <(cd "$D/minios/boot" && grep -rlE --include='*.cfg' 'initrfs' grub syslinux 2>/dev/null | LC_ALL=C sort)
+    printf '%s\n' "${CF[@]}" | grep -q '^grub/' || die "Ningún .cfg de /minios/boot/grub nombra initrfs (no sé dónde poner $IMGX)"
+    mkdir -p "$W/cfg"
+    for c in "${CF[@]}"; do
+        mos_editar_cfg "$D/minios/boot/$c" "$ET" > "$W/cfg/${c//\//_}" || die "No pude editar $c"
+        grep -q "$IMGX" "$W/cfg/${c//\//_}" || die "$c: no pude añadir $IMGX"
+    done
+
+    # 5) espacio y sustitución (con las anteriores guardadas)
+    local libre need; libre=$(df -Pk "$D" | awk 'END{print $4}'); need=$(( ( $(stat -c %s "$W/$IMGX") + $(stat -c %s "$W/$MODULO") ) / 1024 + 1024 ))
+    (( libre > need )) || die "Sin espacio en $DEV (libres ${libre} KB, hacen falta ${need} KB)"
+    local A=.guardian-anterior
+    for p in "minios/boot/$IMGX" "minios/$MODULO"; do [[ -f "$D/$p" ]] && { cp "$D/$p" "$D/$p$A" || die "No pude guardar $p anterior"; }; done
+    for c in "${CF[@]}"; do cp "$D/minios/boot/$c" "$D/minios/boot/$c$A" || die "No pude guardar $c"; done
+    cp "$W/$IMGX" "$D/minios/boot/$IMGX.nuevo" && mv -f "$D/minios/boot/$IMGX.nuevo" "$D/minios/boot/$IMGX" || die "No pude escribir $IMGX"
+    cp "$W/$MODULO" "$D/minios/$MODULO.nuevo" && mv -f "$D/minios/$MODULO.nuevo" "$D/minios/$MODULO" || die "No pude escribir $MODULO"
+    for c in "${CF[@]}"; do cat "$W/cfg/${c//\//_}" > "$D/minios/boot/$c" || die "No pude escribir $c"; done
+    sync
+    cmp -s "$W/$IMGX" "$D/minios/boot/$IMGX" && cmp -s "$W/$MODULO" "$D/minios/$MODULO" || die "Las copias en $DEV no coinciden"
+    echo "  ✔ ${#CF[@]} archivo(s) .cfg de /minios/boot con $IMGX${ET:+ y from=/dev/disk/by-label/$ET/minios} (${CF[*]})"
+    mos_soltar; trap - EXIT
+    echo ""
+    echo "✅ Guardian en MiniOS ($DEV): /minios/boot/$IMGX + /minios/$MODULO"
+    echo "   Anteriores: *$A en /minios y /minios/boot"
+    echo "   Resultado tras arrancar MiniOS: cat /run/guardian/early_status ; journalctl -b -u guardian-late"
+    echo "   Si cambias /etc/guardian/early.conf: vuelve a ejecutar este instalador"
+}
+[[ "${GUARDIAN_MINIOS_FUNCIONES:-0}" == 1 ]] || main "$@"

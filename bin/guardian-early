@@ -1,0 +1,651 @@
+#!/bin/sh
+# ═══════════════════════════════════════════════════════════════
+#  guardian-early v4.12.0 — POSIX sh (corre dentro del initramfs)
+#  Solo toca el filesystem RAÍZ, antes de montarlo.
+#  Nunca bloquea el arranque (siempre sale con 0).
+#  Comunica el resultado a la fase tardía en /run/guardian/early_status
+#  (/run se conserva al pasar al root real).
+#  Estados: ok | repaired | forced | failed | skipped | none
+#  (sin cambios de lógica respecto a v4.11.3, la versión probada en
+#   Debian, Ubuntu y Arch)
+# ═══════════════════════════════════════════════════════════════
+PATH="${GUARDIAN_PATH:-/sbin:/usr/sbin:/bin:/usr/bin}"   # GUARDIAN_PATH: solo pruebas
+export PATH
+set -f   # sin expansión de comodines al recorrer /proc/cmdline
+
+RUN="${GUARDIAN_RUN:-/run/guardian}"
+CONF="${GUARDIAN_EARLY_CONF:-/etc/guardian-early.conf}"
+ALLOW_YES=0
+# shellcheck disable=SC1090
+[ -f "$CONF" ] && . "$CONF"
+
+mkdir -p "$RUN" 2>/dev/null
+LOG="$RUN/early.log"
+STATUS="$RUN/early_status"
+
+log() {
+    _up=""; read _up _ </proc/uptime 2>/dev/null
+    echo "[guardian-early ${_up:++${_up}s}] $*" >>"$LOG" 2>/dev/null
+    echo "[guardian-early] $*" >&2
+}
+# El initramfs de Debian (klibc) NO trae cp, rm, grep ni sed: solo shell y unos pocos comandos.
+# Copiar el log: con cat y redirección (nunca cp).
+put_log() { cat "$LOG" >"$1" 2>/dev/null; }
+# ¿Está montado el dispositivo? Solo shell (sin grep).
+is_mounted() {
+    while read -r _d _r; do [ "$_d" = "$1" ] && return 0; done </proc/mounts 2>/dev/null
+    return 1
+}
+set_status() { echo "$1" >"$STATUS" 2>/dev/null; }
+# --- v4.16: red de emergencia "reiniciar UNA vez" -----------------------
+# Contador en el disco de respaldo (guardian-backups/emergencia-reinicio.txt).
+# Sin disco de respaldo, o con el contador reciente, NO se reinicia.
+# early.conf: EMERGENCY_REBOOT=once (por defecto) | no ; EMERGENCY_WINDOW=3600
+# Solo órdenes internas del shell y de klibc (regla del proyecto).
+g416_en_initramfs() {
+    [ -e /etc/initrd-release ] && return 0
+    [ -e /conf/initramfs.conf ] && return 0
+    [ -r /proc/mounts ] || return 1
+    while read -r _g_a _g_b _g_c; do
+        if [ "$_g_a" = rootfs ] && [ "$_g_b" = / ]; then return 0; fi
+    done </proc/mounts
+    return 1
+}
+g416_montado() {
+    [ -n "$1" ] || return 1
+    [ -r /proc/mounts ] || return 1
+    while read -r _g_a _g_b _g_c; do
+        [ "$_g_b" = "$1" ] && return 0
+    done </proc/mounts
+    return 1
+}
+g416_reiniciar() {
+    if [ -n "${GUARDIAN_REBOOT_CMD:-}" ]; then $GUARDIAN_REBOOT_CMD; return 0; fi
+    echo "Guardian: raiz sin reparar; reinicio unico en 5 s" >/dev/console 2>/dev/null
+    sync; sleep 5
+    echo 1 >/proc/sys/kernel/sysrq 2>/dev/null
+    echo b >/proc/sysrq-trigger 2>/dev/null
+    sleep 5
+    reboot -f 2>/dev/null
+}
+g416_red_una_vez() {
+    trap - 0
+    _g_st=""; [ -r "$STATUS" ] && read -r _g_st <"$STATUS"
+    [ "$_g_st" = "failed" ] || return 0
+    if [ -z "${GUARDIAN_REBOOT_CMD:-}" ] && ! g416_en_initramfs; then return 0; fi
+    case "${EMERGENCY_REBOOT:-once}" in
+        once) ;;
+        *) log "red de emergencia: desactivada (EMERGENCY_REBOOT=${EMERGENCY_REBOOT:-}); consola"; return 0 ;;
+    esac
+    if ! type find_backup_dir >/dev/null 2>&1; then
+        log "red de emergencia: sin disco de respaldo a mano; no se reinicia (consola)"; return 0
+    fi
+    if ! g416_montado "${BKMNT:-}"; then
+        bkdir=""; BKMNT=""
+        find_backup_dir >/dev/null 2>&1 || true
+    fi
+    if [ -z "${bkdir:-}" ] || [ ! -d "$bkdir" ]; then
+        log "red de emergencia: no hay disco de respaldo; no se reinicia (consola)"; return 0
+    fi
+    _g_f="$bkdir/guardian-backups/emergencia-reinicio.txt"
+    _g_now="${GUARDIAN_NOW:-}"
+    if [ -z "$_g_now" ] && [ -r /sys/class/rtc/rtc0/since_epoch ]; then read -r _g_now </sys/class/rtc/rtc0/since_epoch; fi
+    case "$_g_now" in ''|*[!0-9]*) _g_now=0 ;; esac
+    _g_win="${EMERGENCY_WINDOW:-3600}"; case "$_g_win" in ''|*[!0-9]*) _g_win=3600 ;; esac
+    _g_go=1
+    if [ -f "$_g_f" ]; then
+        _g_go=0; _g_old=""
+        while IFS='=' read -r _g_k _g_v; do
+            if [ "$_g_k" = epoch ] && [ -z "$_g_old" ]; then _g_old="$_g_v"; fi
+        done <"$_g_f"
+        case "$_g_old" in ''|*[!0-9]*) _g_old="" ;; esac
+        if [ -n "$_g_old" ] && [ $((_g_now - _g_old)) -gt "$_g_win" ]; then _g_go=1; fi
+    fi
+    if [ "$_g_go" = 1 ]; then
+        mkdir -p "$bkdir/guardian-backups" 2>/dev/null
+        if { echo "epoch=$_g_now"; echo "raiz=${dev:-?}"; echo "nota=Guardian reinicio una vez tras failed"; } >"$_g_f" 2>/dev/null && [ -s "$_g_f" ]; then
+            log "red de emergencia: primer fallo; contador escrito; se reinicia UNA vez"
+        else
+            log "red de emergencia: no se pudo escribir el contador; no se reinicia (consola)"; _g_go=0
+        fi
+    else
+        echo "segundo_fallo=$_g_now" >>"$_g_f" 2>/dev/null
+        log "red de emergencia: ya se reinicio una vez (contador presente); consola"
+    fi
+    sync
+    if [ -n "${BKMNT:-}" ]; then umount "$BKMNT" >>"$LOG" 2>&1; rmdir "$BKMNT" 2>/dev/null; fi
+    [ "$_g_go" = 1 ] || return 0
+    g416_reiniciar
+}
+trap g416_red_una_vez 0
+# --- fin v4.16 ------------------------------------------------------------
+
+# Convierte UUID=/LABEL=/PARTUUID=/PARTLABEL=/ruta en una ruta de dispositivo
+resolve_spec_udev() {
+    case "$1" in
+        UUID=*)      echo "/dev/disk/by-uuid/${1#UUID=}" ;;
+        LABEL=*)     echo "/dev/disk/by-label/${1#LABEL=}" ;;
+        PARTUUID=*)  echo "/dev/disk/by-partuuid/${1#PARTUUID=}" ;;
+        PARTLABEL=*) echo "/dev/disk/by-partlabel/${1#PARTLABEL=}" ;;
+        /*)          echo "$1" ;;
+        *)           echo "" ;;
+    esac
+}
+# >>> resolve_spec (4.18.0)
+# Sin udev (Alpine con mdev, initramfs busybox) no hay /dev/disk/by-*: si esa ruta no existe se
+# pregunta a findfs o a blkid (solo si están). Si nada responde, la ruta de siempre (como antes).
+resolve_spec() {
+    _g_rs=$(resolve_spec_udev "$1")
+    case "$1" in
+        UUID=*|LABEL=*|PARTUUID=*|PARTLABEL=*)
+            if [ -n "$_g_rs" ] && [ ! -e "$_g_rs" ]; then
+                _g_rd=""
+                if command -v findfs >/dev/null 2>&1; then _g_rd=$(findfs "$1" 2>/dev/null); fi
+                if [ -z "$_g_rd" ] && command -v blkid >/dev/null 2>&1; then
+                    for _g_rx in $(blkid -o device -t "$1" 2>/dev/null); do _g_rd=$_g_rx; break; done
+                fi
+                case "$_g_rd" in
+                    /*) [ -e "$_g_rd" ] && _g_rs=$_g_rd ;;
+                esac
+            fi
+            ;;
+    esac
+    echo "$_g_rs"
+}
+# <<< resolve_spec
+
+# >>> blkid (4.18.0)
+# El blkid de busybox (initramfs de Alpine) no tiene opciones: toma TODA palabra como dispositivo
+# («blkid -o device» busca un dispositivo llamado «device» → nada) y escribe «dev: TAG="v" …».
+# Si el blkid real es busybox, se le pasan solo las rutas (ninguna = todos) y aquí se da lo que daría
+# util-linux en los usos de este script: -o value -s TAG, -o device [-t TAG=v]. Con util-linux, tal cual.
+if command -v blkid >/dev/null 2>&1; then
+_g_bbx=0
+case "$(readlink -f "$(command -v blkid)" 2>/dev/null)" in */busybox) _g_bbx=1 ;; esac
+blkid() {
+    if [ "$_g_bbx" != 1 ]; then
+        _g_bo=$(command blkid "$@" 2>/dev/null); _g_bc=$?
+        case "$_g_bo" in
+            *': '*'="'*) ;;
+            *) [ -n "$_g_bo" ] && echo "$_g_bo"; return $_g_bc ;;
+        esac
+    fi
+    _g_bs=""; _g_bt=""; _g_bd=0; _g_bv=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -s) _g_bs=${2:-}; [ $# -gt 1 ] && shift ;;
+            -t) _g_bt=${2:-}; [ $# -gt 1 ] && shift ;;
+            -o) [ "${2:-}" = device ] && _g_bd=1; [ $# -gt 1 ] && shift ;;
+            /*) _g_bv="$_g_bv $1" ;;
+        esac
+        shift
+    done
+    if [ "$_g_bbx" = 1 ]; then
+        # shellcheck disable=SC2086
+        _g_bo=$(command blkid $_g_bv 2>/dev/null)
+    fi
+    echo "$_g_bo" | while IFS= read -r _g_bl; do
+        [ -n "$_g_bl" ] || continue
+        case "$_g_bl" in *': '*) ;; *) continue ;; esac
+        if [ -n "$_g_bt" ]; then
+            case "$_g_bl" in *" ${_g_bt%%=*}=\"${_g_bt#*=}\""*) ;; *) continue ;; esac
+        fi
+        if [ "$_g_bd" = 1 ]; then
+            echo "${_g_bl%%:*}"
+        elif [ -n "$_g_bs" ]; then
+            case "$_g_bl" in
+                *" $_g_bs=\""*) _g_bx=${_g_bl#*" $_g_bs=\""}; echo "${_g_bx%%\"*}" ;;
+            esac
+        else
+            echo "$_g_bl"
+        fi
+    done
+    return 0
+}
+fi
+# <<< blkid
+
+# e2fsck: 0 limpio, 1 corregido, 2/3 corregido(+reinicio; irrelevante si está
+# desmontado). Cualquier bit de 4,8,16,32,128 = fallo.
+fsck_ok() { [ $(($1 & 252)) -eq 0 ]; }
+
+# Escape explícito
+for w in $(cat /proc/cmdline 2>/dev/null); do
+    case "$w" in
+        guardian.skip) log "guardian.skip en cmdline"; set_status skipped; exit 0 ;;
+    esac
+done
+
+# Dispositivo raíz
+root=""
+for w in $(cat /proc/cmdline 2>/dev/null); do
+    case "$w" in root=*) root="${w#root=}" ;; esac
+done
+[ -n "${ROOT:-}" ] && root="$ROOT"
+dev=$(resolve_spec "$root")
+
+if [ -z "$dev" ] || [ ! -e "$dev" ]; then
+    log "dispositivo raíz no resuelto ($root) — se omite"
+    set_status skipped
+    exit 0
+fi
+
+if ! command -v e2fsck >/dev/null 2>&1 || ! command -v blkid >/dev/null 2>&1; then
+    log "faltan e2fsck/blkid en el initramfs — se omite"
+    set_status skipped
+    exit 0
+fi
+
+fstype=$(blkid -o value -s TYPE "$dev" 2>/dev/null)
+case "$fstype" in
+    ext2|ext3|ext4) ;;
+    btrfs|xfs) NONEXT=1 ;;
+    *) log "raíz $dev es '$fstype' (no ext) — se omite"; set_status skipped; exit 0 ;;
+esac
+
+# Hibernación: si la imagen de reanudación sigue ahí, NO tocar nada.
+# (El PREREQ="resume" ya hace que el script resume corra antes; esto es un seguro extra.)
+RESUME=""
+# shellcheck disable=SC1091
+[ -f /conf/conf.d/resume ] && . /conf/conf.d/resume
+# (4.17.5) fuera de Debian (dracut, mkinitcpio) no hay /conf/conf.d/resume: resume= y
+# resume_offset= (swapfile) se leen de la línea del kernel
+ROFF=""
+if [ -r "${GUARDIAN_CMDLINE:-/proc/cmdline}" ]; then
+    read -r _cl <"${GUARDIAN_CMDLINE:-/proc/cmdline}"
+    for _w in $_cl; do
+        case "$_w" in
+            resume=*) [ -z "$RESUME" ] && RESUME="${_w#resume=}" ;;
+            resume_offset=*) ROFF="${_w#resume_offset=}" ;;
+        esac
+    done
+fi
+if [ -n "$RESUME" ] && [ "$RESUME" != "none" ]; then
+    rdev=$(resolve_spec "$RESUME")
+    if [ -n "$rdev" ] && [ -e "$rdev" ]; then
+        rtype=$(blkid -o value -s TYPE "$rdev" 2>/dev/null)
+        # (4.17.5) swapfile: firma de la página de swap en resume_offset (páginas de 4 KiB)
+        case "$ROFF" in
+            ''|*[!0-9]*) ;;
+            *) if command -v dd >/dev/null 2>&1; then
+                   _rs=""; _rp="${RUN:-/run/guardian}/resume-pagina"
+                   dd if="$rdev" of="$_rp" bs=4096 skip="$ROFF" count=1 2>/dev/null \
+                       && _rs=$(dd if="$_rp" bs=1 skip=4086 count=10 2>/dev/null)
+                   rm -f "$_rp" 2>/dev/null || : >"$_rp" 2>/dev/null
+                   case "$_rs" in S1SUSPEND*|S2SUSPEND*|ULSUSPEND*|LINHIB0001*) rtype=swsuspend ;; esac
+               else
+                   log "hibernación: hay resume_offset pero no dd en el initramfs: no se puede mirar el swapfile"
+               fi ;;
+        esac
+        if [ "$rtype" = "swsuspend" ]; then
+            log "imagen de hibernación presente en $rdev — NO se hace fsck"
+            set_status skipped
+            exit 0
+        fi
+    fi
+fi
+
+# No tocar si por alguna razón ya está montado
+if is_mounted "$dev"; then
+    log "$dev ya montado — se omite"
+    set_status skipped
+    exit 0
+fi
+
+if [ "${NONEXT:-0}" = 1 ]; then
+    # Raíz btrfs/xfs (v4.14): sin chequeo completo en cada arranque; el disparador es un
+    # montaje de prueba en solo lectura (que ya reproduce el log). Solo si falla se repara.
+    NOTOOL=""
+    case "$fstype" in
+        xfs)   command -v xfs_repair >/dev/null 2>&1 || NOTOOL=xfs_repair ;;
+        btrfs) command -v btrfs >/dev/null 2>&1 || NOTOOL=btrfs ;;
+    esac
+    if [ -n "$NOTOOL" ]; then
+        log "raíz $fstype: falta $NOTOOL en el initramfs — se omite"
+        set_status skipped
+        exit 0
+    fi
+    nx_probe() {
+        _pm="$RUN/fsprobe"
+        mkdir -p "$_pm" 2>/dev/null
+        if mount -t "$fstype" -o ro "$dev" "$_pm" >>"$LOG" 2>&1; then
+            umount "$_pm" >>"$LOG" 2>&1 || log "aviso: no se pudo desmontar $_pm"
+            rmdir "$_pm" 2>/dev/null
+            return 0
+        fi
+        rmdir "$_pm" 2>/dev/null
+        return 1
+    }
+    log "raíz $dev ($fstype): montaje de prueba en solo lectura"
+    if nx_probe; then
+        log "OK: la raíz $fstype se monta sin errores"
+        set_status ok
+        exit 0
+    fi
+    log "la raíz $fstype NO se pudo montar: se intenta reparar"
+fi
+if [ "${NONEXT:-0}" != 1 ]; then
+log "fsck de raíz $dev ($fstype): e2fsck -p"
+e2fsck -p "$dev" >>"$LOG" 2>&1
+rc=$?
+if fsck_ok "$rc"; then
+    if [ "$rc" -eq 0 ]; then
+        log "OK (rc=0)"
+        set_status ok
+    else
+        log "reparado con -p (rc=$rc)"
+        set_status repaired
+    fi
+    exit 0
+fi
+
+log "e2fsck -p falló (rc=$rc) — reintento -p una vez más"
+# En un disco real, un segundo preen a veces tiene éxito donde el primero se negó
+# (observado en pruebas). Sigue siendo preen: nunca usa -y.
+e2fsck -p "$dev" >>"$LOG" 2>&1
+rc=$?
+if fsck_ok "$rc"; then
+    log "reparado con -p en el 2.º intento (rc=$rc)"
+    set_status repaired
+    exit 0
+fi
+log "e2fsck -p falló también en el 2.º intento (rc=$rc)"
+
+fi   # fin de la rama ext2/3/4 (v4.14)
+
+# ── Política ante un daño que -p no puede reparar ──
+#   nada               → no se toca; estado failed (Debian puede detener el arranque)
+#   solo_con_respaldo  → se fuerza (-y) SOLO si antes se pudo hacer el respaldo
+#   respaldo_y_forzar  → respaldo si hay espacio; si no hay, se fuerza igualmente (por defecto)
+#   forzar             → se fuerza (-y) sin intentar respaldo   (equivale al antiguo ALLOW_YES=1)
+POLICY="${ON_FAIL:-}"
+if [ -z "$POLICY" ]; then
+    if [ "$ALLOW_YES" = "1" ]; then POLICY=forzar; else POLICY=respaldo_y_forzar; fi
+fi
+log "política ante fallo: $POLICY"
+if [ "$POLICY" = "nada" ]; then
+    set_status failed
+    exit 0
+fi
+
+# El "respaldo" es un archivo de deshacer de e2fsck (-z): guarda el contenido ORIGINAL de cada
+# bloque que la reparación modifica; e2undo lo revierte. Es pequeño (solo lo que cambia),
+# a diferencia de copiar todo el disco. Se guarda en OTRA partición con espacio libre.
+BACKUP_MIN_MB="${BACKUP_MIN_MB:-512}"
+bkdir=""; BKMNT=""; BKDEV=""
+
+# Espacio libre en MB (solo shell: sin awk). Última línea de "df -Pk": ... Disponible, Uso%, Montado en
+free_mb() {
+    _df=guardian-df; command -v guardian-df >/dev/null 2>&1 || _df=df
+    _out=$($_df -Pk "$1" 2>/dev/null) || { echo 0; return; }
+    set -- $_out
+    [ "$#" -ge 12 ] || { echo 0; return; }
+    eval "_a=\${$(($# - 2))}"
+    case "$_a" in ''|*[!0-9]*) echo 0 ;; *) echo $((_a / 1024)) ;; esac
+}
+
+find_backup_dir() {
+    if [ -n "${GUARDIAN_BACKUP_DIR:-}" ]; then   # solo para pruebas
+        mkdir -p "$GUARDIAN_BACKUP_DIR" 2>/dev/null || return 0
+        f=$(free_mb "$GUARDIAN_BACKUP_DIR")
+        [ "${f:-0}" -ge "$BACKUP_MIN_MB" ] && bkdir="$GUARDIAN_BACKUP_DIR" && BKDEV="prueba"; BKFS="${GUARDIAN_BACKUP_FS:-}"
+        return 0
+    fi
+    rdev=$(readlink -f "$dev" 2>/dev/null)
+    n=0
+    # Dos pasadas: primero particiones ext (aceptan archivos dispersos), vfat solo como último recurso
+    for _pass in ext vfat; do
+    for d in $(blkid -o device 2>/dev/null); do
+        [ "$(readlink -f "$d" 2>/dev/null)" = "$rdev" ] && continue
+        t=$(blkid -o value -s TYPE "$d" 2>/dev/null)
+        case "$_pass:$t" in ext:ext2|ext:ext3|ext:ext4|vfat:vfat) ;; *) continue ;; esac
+        # Nunca usar la partición EFI (ESP): guarda el arranque y es chica
+        case "$(blkid -o value -s PART_ENTRY_TYPE "$d" 2>/dev/null)" in
+            [Cc]12[Aa]7328-[Ff]81[Ff]-11[Dd]2-[Bb][Aa]4[Bb]-00[Aa]0[Cc]93[Ee][Cc]93[Bb]) log "respaldo: se omite $d (partición EFI)"; continue ;;
+        esac
+        # BACKUP_EXCLUDE (opcional): UUIDs de particiones que NUNCA se usan (p. ej. un disco que está fallando)
+        _u=$(blkid -o value -s UUID "$d" 2>/dev/null)
+        case " ${BACKUP_EXCLUDE:-} " in *" $_u "*) [ -n "$_u" ] && { log "respaldo: se omite $d (UUID=$_u en BACKUP_EXCLUDE)"; continue; } ;; esac
+        # BACKUP_UUID (opcional, en early.conf): usar SOLO esa partición para el respaldo
+        if [ -n "${BACKUP_UUID:-}" ] && [ "$(blkid -o value -s UUID "$d" 2>/dev/null)" != "$BACKUP_UUID" ]; then continue; fi
+        n=$((n + 1)); m="$RUN/bk$n"; mkdir -p "$m"
+        if mount -t "$t" -o rw,noatime "$d" "$m" >>"$LOG" 2>&1; then
+            f=$(free_mb "$m")
+            if [ "${f:-0}" -ge "$BACKUP_MIN_MB" ]; then
+                bkdir="$m"; BKMNT="$m"; BKDEV=$(blkid -o value -s UUID "$d" 2>/dev/null); BKFS="$t"
+                log "respaldo: $d (${f} MB libres) montado en $m"
+                return 0
+            fi
+            umount "$m" >>"$LOG" 2>&1
+        fi
+        rmdir "$m" 2>/dev/null
+    done
+    done
+    return 0
+}
+
+# (4.17.5) ¿cabe la imagen de METADATOS? Se estima con el tamaño de la raíz: hace falta
+# META_PCT % (por defecto 5) de la raíz + BACKUP_MIN_MB libres. Sin tamaño conocido: como antes.
+meta_cabe() {   # $1 dispositivo de la raíz, $2 MB libres en el destino
+    _mn=${1##*/}; _ms=""
+    [ -r "${GUARDIAN_SYSBLK:-/sys/class/block}/$_mn/size" ] && read -r _ms <"${GUARDIAN_SYSBLK:-/sys/class/block}/$_mn/size"
+    # (4.17.6) /dev/mapper/* (LUKS, LVM): enlace a dm-N (udev) o búsqueda por dm/name
+    if [ -z "$_ms" ] && [ -L "$1" ] && command -v readlink >/dev/null 2>&1; then
+        _mt=$(readlink "$1"); _mt=${_mt##*/}
+        [ -r "${GUARDIAN_SYSBLK:-/sys/class/block}/$_mt/size" ] && read -r _ms <"${GUARDIAN_SYSBLK:-/sys/class/block}/$_mt/size"
+    fi
+    if [ -z "$_ms" ]; then
+        for _md in "${GUARDIAN_SYSBLK:-/sys/class/block}"/dm-*; do
+            [ -r "$_md/dm/name" ] || continue
+            read -r _mt <"$_md/dm/name"
+            if [ "$_mt" = "$_mn" ]; then read -r _ms <"$_md/size"; break; fi
+        done
+    fi
+    case "$_ms" in ''|*[!0-9]*) log "metadatos: no sé el tamaño de $1: se intenta como antes"; return 0 ;; esac
+    _mp=${META_PCT:-5}
+    case "$_mp" in ''|*[!0-9]*) _mp=5 ;; esac
+    _mt=$((_ms / 2048)); _mneed=$((_mt * _mp / 100 + ${BACKUP_MIN_MB:-512}))
+    [ "${2:-0}" -ge "$_mneed" ] && return 0
+    log "metadatos: la raíz mide ${_mt} MB; con META_PCT=${_mp} % harían falta ${_mneed} MB y hay ${2:-0}: se omite la imagen"
+    return 1
+}
+if [ "$POLICY" != "forzar" ]; then
+    find_backup_dir
+fi
+
+if [ "${NONEXT:-0}" = 1 ]; then
+    # ── Raíz btrfs/xfs: reparación mínima. NUNCA btrfs check --repair (v4.14) ──
+    if [ "$POLICY" = "solo_con_respaldo" ] && [ -z "$bkdir" ]; then
+        log "no hay espacio para el respaldo y la política es solo_con_respaldo → NO se repara"
+        set_status failed
+        exit 0
+    fi
+    if [ -z "$bkdir" ] && [ "$POLICY" = "respaldo_y_forzar" ]; then
+        log "SIN RESPALDO: no hay otra partición con ${BACKUP_MIN_MB} MB libres; se repara igualmente (política respaldo_y_forzar)"
+    fi
+    nx_dir=""; nx_meta=""; nx_ok=0; nx_mode=repaired
+    nx_id=$(date +%Y%m%d_%H%M%S 2>/dev/null) || nx_id=""
+    [ -n "$nx_id" ] || nx_id="sin-fecha"
+    if [ -n "$bkdir" ]; then
+        nx_dir="$bkdir/guardian-backups"
+        mkdir -p "$nx_dir" 2>/dev/null
+        _n=1
+        while [ -e "$nx_dir/root-${fstype}-${nx_id}-${_n}.log" ]; do _n=$((_n + 1)); done
+        nx_id="${nx_id}-${_n}"
+        : >"$nx_dir/root-${fstype}-${nx_id}.log" 2>/dev/null
+        # Respaldo de METADATOS. Con el disco muy dañado puede fallar: no es una red de seguridad
+        # (no permite deshacer); sirve para estudiar o reconstruir la estructura.
+        if [ "${BKFS:-}" = "vfat" ]; then
+            log "metadatos: el destino es vfat: se omite la imagen de metadatos"
+        else
+            _f=$(free_mb "$bkdir")
+            if [ "${_f:-0}" -ge "${META_MIN_MB:-2048}" ] && meta_cabe "$dev" "$_f"; then
+                nx_meta="$nx_dir/root-meta-${nx_id}.${fstype}"
+                _okm=1
+                case "$fstype" in
+                    xfs)   command -v xfs_db >/dev/null 2>&1 && xfs_db -r -p xfs_metadump -c "metadump $nx_meta" "$dev" >>"$LOG" 2>&1 || _okm=0 ;;
+                    btrfs) command -v btrfs-image >/dev/null 2>&1 && btrfs-image "$dev" "$nx_meta" >>"$LOG" 2>&1 || _okm=0 ;;
+                esac
+                if [ "$_okm" = 1 ]; then
+                    log "respaldo de metadatos: $nx_meta"
+                else
+                    log "no se pudo guardar el respaldo de metadatos (herramienta ausente o disco muy dañado): se continúa sin él"
+                    rm -f "$nx_meta" 2>/dev/null || : >"$nx_meta" 2>/dev/null
+                    nx_meta=""
+                fi
+            else
+                log "metadatos: solo ${_f:-0} MB libres (META_MIN_MB=${META_MIN_MB:-2048}): se omite la imagen de metadatos"
+            fi
+        fi
+    fi
+    # ¿Se permiten los pasos que descartan el log (xfs_repair -L, btrfs zero-log)?
+    nx_force=0
+    case "$POLICY" in
+        respaldo_y_forzar|forzar) nx_force=1 ;;
+        solo_con_respaldo) [ -n "$nx_meta" ] && nx_force=1 ;;
+    esac
+    case "$fstype" in
+    xfs)
+        nx_mode=forced
+        log "xfs_repair (sin -L)"
+        xfs_repair "$dev" >>"$LOG" 2>&1
+        sync
+        if nx_probe; then nx_ok=1
+        elif [ "$nx_force" = 1 ]; then
+            log "sigue sin montar: xfs_repair -L (descarta el log: se pierden las últimas transacciones)"
+            xfs_repair -L "$dev" >>"$LOG" 2>&1
+            sync
+            if nx_probe; then nx_ok=1; fi
+        else
+            log "sigue sin montar y la política no permite descartar el log (-L)"
+        fi ;;
+    btrfs)
+        log "btrfs rescue super-recover (solo reescribe superbloques dañados)"
+        btrfs rescue super-recover -y "$dev" >>"$LOG" 2>&1
+        sync
+        if nx_probe; then nx_ok=1
+        elif [ "$nx_force" = 1 ]; then
+            nx_nd=""
+            btrfs inspect-internal dump-super "$dev" >"$RUN/nx_super" 2>/dev/null
+            while read -r _k _v _; do [ "$_k" = "num_devices" ] && nx_nd="$_v"; done <"$RUN/nx_super"
+            if [ "$nx_nd" = 1 ]; then
+                nx_mode=forced
+                log "sigue sin montar: btrfs rescue zero-log (descarta el log: se pierden hasta ~30 s de cambios)"
+                btrfs rescue zero-log "$dev" >>"$LOG" 2>&1
+                sync
+                if nx_probe; then nx_ok=1; fi
+            else
+                log "zero-log no se usa: num_devices='${nx_nd:-?}' (solo con 1 dispositivo)"
+            fi
+        else
+            log "sigue sin montar y la política no permite descartar el log (zero-log)"
+        fi ;;
+    esac
+    if [ -n "$nx_dir" ]; then
+        {
+            printf 'BACKUP_DEV=%s\n' "$BKDEV"
+            [ -n "$nx_meta" ] && printf 'META_FILE=guardian-backups/%s\n' "${nx_meta##*/}"
+            printf 'FSCK_LOG=guardian-backups/root-%s-%s.log\n' "$fstype" "$nx_id"
+        } >"$RUN/early_backup" 2>/dev/null
+    else
+        echo "BACKUP=ninguno" >"$RUN/early_backup" 2>/dev/null
+    fi
+    if [ "$nx_ok" = 1 ]; then
+        log "raíz $fstype montable de nuevo ($nx_mode)"
+        set_status "$nx_mode"
+    else
+        log "no se pudo dejar la raíz $fstype montable: se necesita recuperación manual"
+        set_status failed
+    fi
+    [ -n "$nx_dir" ] && put_log "$nx_dir/root-${fstype}-${nx_id}.log"
+    sync
+    if [ -n "$BKMNT" ]; then umount "$BKMNT" >>"$LOG" 2>&1; rmdir "$BKMNT" 2>/dev/null; fi
+    exit 0
+fi
+undo=""; meta=""; bkid=""; live=""; LIVEPID=""
+# Registro "en vivo": mientras dura un paso largo, copia el log a la partición de respaldo cada 2 s
+# (el log normal vive en /run = memoria y se pierde si el equipo se reinicia a medio camino).
+live_start() {
+    [ -n "$live" ] || return 0
+    ( while :; do put_log "$live"; sync; sleep 2; done ) &
+    LIVEPID=$!
+}
+live_stop() {
+    if [ -n "$LIVEPID" ]; then kill "$LIVEPID" 2>/dev/null; wait "$LIVEPID" 2>/dev/null; LIVEPID=""; fi
+    [ -n "$live" ] && { put_log "$live"; sync; }
+    return 0
+}
+if [ -n "$bkdir" ]; then
+    mkdir -p "$bkdir/guardian-backups" 2>/dev/null
+    # Nombre único: nunca sobrescribe un respaldo anterior (en el initramfs `date` puede no existir)
+    _ts=$(date +%Y%m%d_%H%M%S 2>/dev/null) || _ts=""
+    [ -n "$_ts" ] || _ts="sin-fecha"
+    _n=1
+    while [ -e "$bkdir/guardian-backups/root-undo-${_ts}-${_n}.e2undo" ]; do _n=$((_n + 1)); done
+    bkid="${_ts}-${_n}"
+    undo="$bkdir/guardian-backups/root-undo-${bkid}.e2undo"
+    live="$bkdir/guardian-backups/early-live-${bkid}.log"
+    live_start
+    log "respaldo: archivo de deshacer en $undo (se revierte con e2undo, solo si el disco no se ha vuelto a montar en escritura)"
+    # Respaldo que SÍ sirve después del arranque: imagen de METADATOS (e2image -r) del disco ANTES
+    # de repararlo. No guarda el contenido de los archivos, pero sí qué archivos/carpetas existían,
+    # sus inodos y sus bloques: permite inspeccionar y recuperar con debugfs aunque el sistema ya se use.
+    if [ "${BKFS:-}" = "vfat" ]; then
+        log "metadatos: el destino es vfat (sin archivos dispersos, e2image llenaría la partición): se omite la imagen de metadatos"
+    elif command -v e2image >/dev/null 2>&1; then
+        _f=$(free_mb "$bkdir")
+        if [ "${_f:-0}" -ge "${META_MIN_MB:-2048}" ] && meta_cabe "$dev" "$_f"; then
+            meta="$bkdir/guardian-backups/root-meta-${bkid}.img"
+            log "respaldo de metadatos: e2image -r → $meta"
+            if ! e2image -r "$dev" "$meta" >>"$LOG" 2>&1; then
+                log "e2image falló (el disco puede estar muy dañado): se omite la imagen de metadatos"
+                rm -f "$meta" 2>/dev/null || : >"$meta" 2>/dev/null; meta=""
+            fi
+        else
+            log "metadatos: solo ${_f:-0} MB libres (META_MIN_MB=${META_MIN_MB:-2048}): se omite la imagen de metadatos"
+        fi
+    else
+        log "e2image no está en el initramfs: se omite la imagen de metadatos"
+    fi
+elif [ "$POLICY" = "solo_con_respaldo" ]; then
+    log "no hay espacio para el respaldo y la política es solo_con_respaldo → NO se fuerza"
+    set_status failed
+    exit 0
+elif [ "$POLICY" = "respaldo_y_forzar" ]; then
+    log "SIN RESPALDO: no hay otra partición con ${BACKUP_MIN_MB} MB libres; se fuerza igualmente (política respaldo_y_forzar)"
+fi
+
+log "e2fsck -fy${undo:+ -z} (reparación forzada)"
+if [ -n "$undo" ]; then
+    e2fsck -fy -z "$undo" "$dev" >>"$LOG" 2>&1
+else
+    e2fsck -fy "$dev" >>"$LOG" 2>&1
+fi
+rc=$?
+sync
+
+if [ -n "$undo" ]; then
+    # Informe de lo que cambió la reparación (líneas de e2fsck: inodos borrados, lost+found, clones...)
+    put_log "$bkdir/guardian-backups/root-fsck-${bkid}.log"
+    {
+        printf 'BACKUP_DEV=%s\nBACKUP_FILE=guardian-backups/%s\n' "$BKDEV" "${undo##*/}"
+        [ -n "$meta" ] && printf 'META_FILE=guardian-backups/%s\n' "${meta##*/}"
+        printf 'FSCK_LOG=guardian-backups/root-fsck-%s.log\n' "$bkid"
+    } >"$RUN/early_backup" 2>/dev/null
+else
+    echo "BACKUP=ninguno" >"$RUN/early_backup" 2>/dev/null
+fi
+
+if fsck_ok "$rc"; then
+    log "reparación forzada completada (rc=$rc)"
+    set_status forced
+else
+    log "e2fsck -fy falló (rc=$rc)"
+    set_status failed
+fi
+# copia final del informe (ya con el veredicto) y desmontaje del disco de respaldo
+live_stop
+[ -n "$undo" ] && put_log "$bkdir/guardian-backups/root-fsck-${bkid}.log"
+sync
+if [ -n "$BKMNT" ]; then umount "$BKMNT" >>"$LOG" 2>&1; rmdir "$BKMNT" 2>/dev/null; fi
+exit 0
